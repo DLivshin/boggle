@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Boggle with Tzirel</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- PeerJS for P2P Multiplayer -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800;900&display=swap');
+        
+        body { font-family: 'Inter', sans-serif; }
+        
+        /* Animations */
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            25% { transform: translateX(-5px); }
+            50% { transform: translateX(5px); }
+            75% { transform: translateX(-5px); }
+        }
+        .shake { animation: shake 0.4s ease-in-out; }
+        
+        @keyframes popIn {
+            0% { opacity: 0; transform: scale(0.95); }
+            100% { opacity: 1; transform: scale(1); }
+        }
+        .pop-in { animation: popIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; }
+        
+        @keyframes float {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-10px); }
+        }
+        .float-anim { animation: float 4s ease-in-out infinite; }
+
+        /* Glassmorphism Premium UI */
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.4);
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25), inset 0 0 0 1px rgba(255,255,255,0.2);
+        }
+        
+        /* Custom Scrollbar for word lists */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.5); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, 0.8); }
+
+        /* Interactive Dice */
+        .boggle-die {
+            box-shadow: 0 6px 0 rgba(148, 163, 184, 0.4), 0 10px 15px -3px rgba(0,0,0,0.1);
+            transition: all 0.1s ease;
+        }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-indigo-600 via-purple-600 to-fuchsia-700 min-h-screen text-slate-800 antialiased flex flex-col overflow-x-hidden">
+
+    <!-- Global Toast Notification -->
+    <div id="toast" class="fixed top-4 left-1/2 transform -translate-x-1/2 z-50 transition-all duration-300 opacity-0 -translate-y-10 pointer-events-none bg-slate-900 text-white px-6 py-3 rounded-full shadow-2xl font-semibold flex items-center gap-2">
+        <span id="toast-msg">Notification</span>
+    </div>
+
+    <!-- Main Application Container -->
+    <div id="app" class="flex-grow flex items-center justify-center p-4 sm:p-8 w-full max-w-5xl mx-auto">
+        <div class="text-white text-xl animate-pulse font-bold">Initializing Game Engine...</div>
+    </div>
+
+    <script>
+        // ==========================================
+        // 1. GAME CONSTANTS & STATE
+        // ==========================================
+        
+        const BOGGLE_DICE = [
+            "AAEEGN", "ABBJOO", "ACHOPS", "AFFKPS",
+            "AOOTTW", "CIMOTU", "DEILRX", "DELRVY",
+            "DISTTY", "EEGHNW", "EEINSU", "EHRTVW",
+            "EIOSST", "ELRTTY", "HIMNQU", "HLNNRZ"
+        ];
+
+        const state = {
+            view: 'home', // home, lobby, game, results
+            role: null,   // 'host' or 'guest'
+            peer: null,
+            conn: null,
+            roomCode: null,
+            board: [],
+            duration: 120,
+            timerInterval: null,
+            myWords: [],
+            oppWords: null, // null until received at the end
+            dictCache: {}
+        };
+
+        const DOM = document.getElementById('app');
+
+        // ==========================================
+        // 2. CORE GAME LOGIC
+        // ==========================================
+
+        function generateBoard() {
+            let dice = [...BOGGLE_DICE].sort(() => Math.random() - 0.5);
+            return dice.map(d => d[Math.floor(Math.random() * 6)]);
+        }
+
+        function isValidPath(word, board) {
+            let searchWord = word.toUpperCase().replace(/QU/g, 'Q');
+            if (searchWord.length < 3) return false;
+
+            const grid = [];
+            for (let i = 0; i < 4; i++) grid.push(board.slice(i * 4, i * 4 + 4));
+
+            const dirs = [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]];
+
+            function dfs(r, c, index, visited) {
+                if (index === searchWord.length) return true;
+                if (r < 0 || r >= 4 || c < 0 || c >= 4 || visited[r][c]) return false;
+                if (grid[r][c] !== searchWord[index]) return false;
+
+                visited[r][c] = true;
+                for (let [dr, dc] of dirs) {
+                    if (dfs(r + dr, c + dc, index + 1, visited)) return true;
+                }
+                visited[r][c] = false;
+                return false;
+            }
+
+            for (let r = 0; r < 4; r++) {
+                for (let c = 0; c < 4; c++) {
+                    const visited = Array(4).fill(0).map(() => Array(4).fill(false));
+                    if (dfs(r, c, 0, visited)) return true;
+                }
+            }
+            return false;
+        }
+
+        async function checkWordDictionary(word) {
+            const lowerWord = word.toLowerCase();
+            if (state.dictCache[lowerWord] !== undefined) return state.dictCache[lowerWord];
+
+            try {
+                const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${lowerWord}`);
+                if (res.ok) {
+                    state.dictCache[lowerWord] = true;
+                    return true;
+                } else if (res.status === 404) {
+                    state.dictCache[lowerWord] = false;
+                    return false;
+                }
+                return true; // Optimistic fallback
+            } catch (e) {
+                return true; // Optimistic fallback on network error
+            }
+        }
+
+        function getWordScore(word) {
+            const l = word.length;
+            if (l < 3) return 0;
+            if (l === 3 || l === 4) return 1;
+            if (l === 5) return 2;
+            if (l === 6) return 3;
+            if (l === 7) return 5;
+            return 11;
+        }
+
+        function formatTime(seconds) {
+            const m = Math.floor(seconds / 60);
+            const s = seconds % 60;
+            return `${m}:${s.toString().padStart(2, '0')}`;
+        }
+
+        function generateRoomCode() {
+            return Math.random().toString(36).substring(2, 6).toUpperCase();
+        }
+
+        function showToast(msg, isError = false) {
+            const toast = document.getElementById('toast');
+            const toastMsg = document.getElementById('toast-msg');
+            toastMsg.textContent = msg;
+            
+            toast.className = `fixed top-6 left-1/2 transform -translate-x-1/2 z-50 transition-all duration-300 px-6 py-3 rounded-full shadow-2xl font-bold flex items-center gap-2 ${
+                isError ? 'bg-red-500 text-white' : 'bg-slate-800 text-white'
+            }`;
+            
+            toast.style.opacity = '1';
+            toast.style.transform = 'translate(-50%, 0)';
+            
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translate(-50%, -20px)';
+            }, 3000);
+        }
+
+        // ==========================================
+        // 3. PEERJS NETWORKING
+        // ==========================================
+
+        function initHost() {
+            const code = generateRoomCode();
+            state.roomCode = code;
+            state.role = 'host';
+            state.peer = new Peer(`BGL-${code}`); // Prefix to avoid global collisions
+
+            state.peer.on('open', (id) => {
+                state.view = 'lobby';
+                renderView();
+            });
+
+            state.peer.on('connection', (connection) => {
+                if (state.conn) {
+                    // Reject subsequent connections
+                    connection.on('open', () => connection.send({ type: 'error', msg: 'Room is full' }));
+                    return;
+                }
+                state.conn = connection;
+                setupConnectionHandlers();
+                state.view = 'lobby'; // Re-render to show guest joined
+                renderView();
+            });
+
+            state.peer.on('error', (err) => {
+                showToast("Connection Error. Try another code.", true);
+                resetState();
+            });
+        }
+
+        function initGuest(code) {
+            state.roomCode = code.toUpperCase();
+            state.role = 'guest';
+            state.peer = new Peer(); // Guest doesn't need a specific ID
+
+            state.peer.on('open', (id) => {
+                state.conn = state.peer.connect(`BGL-${state.roomCode}`, { reliable: true });
+                setupConnectionHandlers();
+            });
+
+            state.peer.on('error', (err) => {
+                showToast("Failed to connect to room.", true);
+                resetState();
+            });
+        }
+
+        function setupConnectionHandlers() {
+            state.conn.on('open', () => {
+                if (state.role === 'guest') {
+                    state.view = 'lobby';
+                    renderView();
+                    showToast("Connected to host!");
+                }
+            });
+
+            state.conn.on('data', (data) => {
+                handleNetworkMessage(data);
+            });
+
+            state.conn.on('close', () => {
+                showToast("Opponent disconnected.", true);
+                resetState();
+            });
+            
+            state.conn.on('error', (err) => {
+                showToast("Connection lost.", true);
+                resetState();
+            });
+        }
+
+        function handleNetworkMessage(data) {
+            switch (data.type) {
+                case 'start':
+                    state.board = data.board;
+                    state.duration = data.duration;
+                    state.myWords = [];
+                    state.oppWords = null;
+                    state.view = 'game';
+                    renderView();
+                    startGameTimer();
+                    break;
+                case 'words':
+                    state.oppWords = data.words;
+                    checkResultsReady();
+                    break;
+                case 'restart':
+                    state.myWords = [];
+                    state.oppWords = null;
+                    state.view = 'lobby';
+                    renderView();
+                    showToast("Host restarted the lobby.");
+                    break;
+                case 'error':
+                    showToast(data.msg, true);
+                    resetState();
+                    break;
+            }
+        }
+
+        function sendNetworkMessage(payload) {
+            if (state.conn && state.conn.open) {
+                state.conn.send(payload);
+            }
+        }
+
+        function resetState() {
+            if (state.timerInterval) clearInterval(state.timerInterval);
+            if (state.peer) state.peer.destroy();
+            state.peer = null;
+            state.conn = null;
+            state.view = 'home';
+            state.role = null;
+            state.roomCode = null;
+            renderView();
+        }
+
+        // ==========================================
+        // 4. GAME FLOW & UI RENDERERS
+        // ==========================================
+
+        function renderView() {
+            if (state.view === 'home') DOM.innerHTML = getHomeHTML();
+            else if (state.view === 'lobby') DOM.innerHTML = getLobbyHTML();
+            else if (state.view === 'game') DOM.innerHTML = getGameHTML();
+            else if (state.view === 'results') DOM.innerHTML = getResultsHTML();
+            
+            attachEventListeners();
+        }
+
+        function getHomeHTML() {
+            return `
+                <div class="glass-panel w-full max-w-md p-10 rounded-[2rem] pop-in flex flex-col items-center relative overflow-hidden">
+                    <!-- Decor -->
+                    <div class="absolute -top-20 -right-20 w-40 h-40 bg-fuchsia-500 rounded-full mix-blend-multiply filter blur-2xl opacity-50"></div>
+                    <div class="absolute -bottom-20 -left-20 w-40 h-40 bg-indigo-500 rounded-full mix-blend-multiply filter blur-2xl opacity-50"></div>
+                    
+                    <div class="relative z-10 w-full text-center">
+                        <div class="mb-6 flex justify-center float-anim">
+                            <div class="w-20 h-20 bg-gradient-to-tr from-indigo-500 to-fuchsia-500 rounded-2xl flex items-center justify-center shadow-2xl transform rotate-12 border-2 border-white/30">
+                                <span class="text-white text-5xl font-black drop-shadow-md">B</span>
+                            </div>
+                        </div>
+                        <h1 class="text-4xl font-black text-slate-800 mb-1 tracking-tight">Boggle</h1>
+                        <p class="text-slate-500 font-medium mb-8">Boggle with Tzirel</p>
+                        
+                        <button id="btn-create" class="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold text-lg py-4 px-6 rounded-2xl shadow-xl hover:shadow-2xl transition-all transform hover:-translate-y-1 mb-6 flex justify-center items-center gap-2">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
+                            Create a Room
+                        </button>
+                        
+                        <div class="flex items-center py-2 mb-6">
+                            <div class="flex-grow border-t border-slate-200"></div>
+                            <span class="mx-4 text-slate-400 font-bold text-xs uppercase tracking-widest">OR JOIN</span>
+                            <div class="flex-grow border-t border-slate-200"></div>
+                        </div>
+                        
+                        <div class="flex gap-2">
+                            <input type="text" id="input-room-code" placeholder="4-LETTER CODE" class="uppercase text-center w-full bg-slate-50 border-2 border-slate-200 text-slate-900 font-bold text-lg py-4 px-4 rounded-2xl focus:outline-none focus:border-indigo-500 focus:bg-white tracking-[0.2em] shadow-inner transition-colors">
+                            <button id="btn-join" class="bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-4 px-6 rounded-2xl shadow-lg transition-all transform hover:-translate-y-1">
+                                Join
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getLobbyHTML() {
+            const isHost = state.role === 'host';
+            const hasGuest = !!state.conn && state.conn.open;
+            
+            return `
+                <div class="glass-panel w-full max-w-md p-10 rounded-[2rem] pop-in text-center relative z-10">
+                    <h2 class="text-sm font-bold text-slate-400 uppercase tracking-widest mb-2">Your Room Code</h2>
+                    <div class="text-6xl font-black tracking-[0.1em] text-slate-800 mb-8 bg-white/50 py-6 rounded-2xl border-2 border-white/60 shadow-inner select-all">
+                        ${state.roomCode}
+                    </div>
+                    
+                    <div class="mb-8 space-y-3">
+                        <div class="flex items-center justify-between p-4 bg-white/60 border border-white/50 rounded-xl shadow-sm">
+                            <div class="flex items-center gap-3">
+                                <div class="w-3 h-3 rounded-full bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.8)]"></div>
+                                <span class="font-bold text-slate-700">You (${isHost ? 'Host' : 'Guest'})</span>
+                            </div>
+                        </div>
+                        <div class="flex items-center justify-between p-4 bg-white/60 border border-white/50 rounded-xl shadow-sm">
+                            <div class="flex items-center gap-3">
+                                <div class="w-3 h-3 rounded-full ${hasGuest ? 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.8)]' : 'bg-amber-400 animate-pulse'}"></div>
+                                <span class="font-bold ${hasGuest ? 'text-slate-700' : 'text-slate-500'}">
+                                    ${hasGuest ? 'Opponent Joined' : 'Waiting for opponent...'}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    ${isHost ? `
+                        <div class="mb-6 bg-slate-50/80 p-4 rounded-2xl border border-slate-200/50">
+                            <label class="block text-sm font-bold text-slate-600 mb-3 text-left">Match Duration (Seconds)</label>
+                            <input type="number" id="input-duration" value="${state.duration}" min="30" max="900" class="w-full bg-white border-2 border-slate-200 text-slate-900 font-bold text-xl rounded-xl py-3 px-4 focus:outline-none focus:border-indigo-500 shadow-inner">
+                        </div>
+                        <button id="btn-start" ${!hasGuest ? 'disabled' : ''} class="w-full ${!hasGuest ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white shadow-xl hover:-translate-y-1'} font-black text-lg py-4 px-6 rounded-2xl transition-all transform">
+                            START GAME
+                        </button>
+                    ` : `
+                        <div class="p-6 bg-white/50 border border-white/50 rounded-2xl text-indigo-700 font-bold flex flex-col items-center gap-3 shadow-sm">
+                            <svg class="animate-spin h-8 w-8 text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                            Waiting for Host to start...
+                        </div>
+                    `}
+                </div>
+            `;
+        }
+
+        function getGameHTML() {
+            return `
+                <div class="glass-panel w-full max-w-4xl p-6 sm:p-10 rounded-[2rem] pop-in flex flex-col lg:flex-row gap-10">
+                    <!-- Left: Board & Timer -->
+                    <div class="flex-1 flex flex-col items-center">
+                        <div class="w-full flex justify-between items-center mb-8 bg-slate-900 rounded-2xl p-4 shadow-xl border border-slate-700">
+                            <div class="flex items-center gap-2">
+                                <div class="w-3 h-3 rounded-full bg-red-500 animate-pulse"></div>
+                                <span class="text-slate-300 font-bold uppercase text-sm tracking-wider">Live</span>
+                            </div>
+                            <div class="text-white font-mono font-black text-3xl flex items-center gap-2" id="ui-timer">
+                                ${formatTime(state.duration)}
+                            </div>
+                        </div>
+                        
+                        <div class="grid grid-cols-4 gap-3 sm:gap-4 bg-indigo-950 p-4 sm:p-5 rounded-[1.5rem] shadow-2xl border-4 border-indigo-900/50 select-none w-full max-w-[24rem]">
+                            ${state.board.map(letter => {
+                                const display = letter === 'Q' ? 'Qu' : letter;
+                                return `<div class="boggle-die aspect-square bg-gradient-to-b from-white to-slate-100 rounded-xl flex items-center justify-center text-4xl sm:text-5xl font-black text-slate-800 uppercase">${display}</div>`;
+                            }).join('')}
+                        </div>
+                    </div>
+                    
+                    <!-- Right: Input & Words -->
+                    <div class="flex-1 flex flex-col h-[32rem]">
+                        <div class="relative w-full mb-6 group">
+                            <input type="text" id="ui-word-input" placeholder="Type word & press Enter" class="w-full bg-white border-2 border-transparent text-slate-900 font-black text-xl py-5 px-6 rounded-2xl focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/20 uppercase tracking-widest shadow-lg transition-all" autocomplete="off" autocorrect="off" spellcheck="false">
+                            <div id="ui-loading" class="absolute right-5 top-5 hidden">
+                                <svg class="animate-spin h-7 w-7 text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                            </div>
+                        </div>
+                        
+                        <div class="flex justify-between items-end mb-4 px-2">
+                            <h3 class="font-black text-xl text-slate-800">Found Words <span id="ui-word-count" class="ml-2 bg-indigo-100 text-indigo-700 py-1 px-3 rounded-lg text-sm">0</span></h3>
+                            <span class="text-xs font-bold text-slate-500 uppercase tracking-widest">Opponent Hidden</span>
+                        </div>
+                        
+                        <div class="bg-white/50 border border-white/60 shadow-inner rounded-2xl p-5 flex-grow overflow-y-auto relative">
+                            <div id="ui-word-list" class="flex flex-wrap gap-2 content-start">
+                                <!-- Words -->
+                            </div>
+                            <div id="ui-end-overlay" class="absolute inset-0 bg-slate-900/90 backdrop-blur-sm rounded-2xl hidden flex-col items-center justify-center text-white z-10 p-6 text-center">
+                                <svg class="animate-spin h-10 w-10 text-indigo-400 mb-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                <h4 class="text-xl font-bold">Time's Up!</h4>
+                                <p class="text-slate-300 font-medium">Waiting for opponent data...</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getResultsHTML() {
+            const p1Words = state.myWords;
+            const p2Words = state.oppWords || [];
+            
+            const p1Set = new Set(p1Words);
+            const p2Set = new Set(p2Words);
+            
+            let p1Score = 0;
+            let p2Score = 0;
+            
+            const p1Render = [];
+            const p2Render = [];
+            
+            // Process My Words
+            p1Words.forEach(w => {
+                if (p2Set.has(w)) {
+                    p1Render.push(`<span class="px-3 py-1.5 bg-slate-200/50 text-slate-500 line-through rounded-lg text-sm font-semibold">${w} <span class="text-xs ml-1 opacity-50">0</span></span>`);
+                } else {
+                    const pts = getWordScore(w);
+                    p1Score += pts;
+                    p1Render.push(`<span class="px-3 py-1.5 bg-green-100 text-green-800 border border-green-200 rounded-lg text-sm font-bold shadow-sm">${w} <span class="text-green-600 bg-green-200/50 px-1.5 rounded text-xs ml-1">+${pts}</span></span>`);
+                }
+            });
+            
+            // Process Opponent Words
+            p2Words.forEach(w => {
+                if (p1Set.has(w)) {
+                    p2Render.push(`<span class="px-3 py-1.5 bg-slate-200/50 text-slate-500 line-through rounded-lg text-sm font-semibold">${w} <span class="text-xs ml-1 opacity-50">0</span></span>`);
+                } else {
+                    const pts = getWordScore(w);
+                    p2Score += pts;
+                    p2Render.push(`<span class="px-3 py-1.5 bg-blue-100 text-blue-800 border border-blue-200 rounded-lg text-sm font-bold shadow-sm">${w} <span class="text-blue-600 bg-blue-200/50 px-1.5 rounded text-xs ml-1">+${pts}</span></span>`);
+                }
+            });
+
+            let winnerText = "It's a Tie!";
+            let winnerColor = "text-amber-400";
+            if (p1Score > p2Score) {
+                winnerText = "You Win! 🏆";
+                winnerColor = "text-green-400";
+            } else if (p2Score > p1Score) {
+                winnerText = "Opponent Wins! 💀";
+                winnerColor = "text-red-400";
+            }
+
+            return `
+                <div class="glass-panel w-full max-w-5xl p-8 sm:p-12 rounded-[2rem] pop-in">
+                    <div class="text-center mb-12">
+                        <div class="inline-block bg-slate-900 px-8 py-3 rounded-full mb-6 shadow-xl border border-slate-700">
+                            <h1 class="text-4xl sm:text-5xl font-black ${winnerColor} tracking-tight">${winnerText}</h1>
+                        </div>
+                        <p class="text-slate-600 font-bold uppercase tracking-widest">Final Post-Game Analysis</p>
+                    </div>
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-10">
+                        <!-- You -->
+                        <div class="bg-white/80 rounded-[1.5rem] p-6 shadow-lg border-t-8 border-green-400 flex flex-col h-80">
+                            <div class="flex justify-between items-end mb-6 pb-4 border-b-2 border-slate-100">
+                                <h2 class="text-2xl font-black text-slate-800">You</h2>
+                                <div class="text-5xl font-black text-green-500 tracking-tighter">${p1Score}<span class="text-lg font-bold text-slate-400 ml-1">pts</span></div>
+                            </div>
+                            <div class="flex flex-wrap gap-2 overflow-y-auto content-start flex-grow pr-2">
+                                ${p1Render.length ? p1Render.join('') : '<span class="text-slate-400 font-medium italic w-full text-center mt-10">No words found.</span>'}
+                            </div>
+                        </div>
+                        
+                        <!-- Opponent -->
+                        <div class="bg-white/80 rounded-[1.5rem] p-6 shadow-lg border-t-8 border-blue-400 flex flex-col h-80">
+                            <div class="flex justify-between items-end mb-6 pb-4 border-b-2 border-slate-100">
+                                <h2 class="text-2xl font-black text-slate-800">Opponent</h2>
+                                <div class="text-5xl font-black text-blue-500 tracking-tighter">${p2Score}<span class="text-lg font-bold text-slate-400 ml-1">pts</span></div>
+                            </div>
+                            <div class="flex flex-wrap gap-2 overflow-y-auto content-start flex-grow pr-2">
+                                ${p2Render.length ? p2Render.join('') : '<span class="text-slate-400 font-medium italic w-full text-center mt-10">No words found.</span>'}
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="text-center">
+                        ${state.role === 'host' ? `
+                            <button id="btn-restart" class="bg-slate-900 hover:bg-slate-800 text-white font-bold text-xl py-4 px-10 rounded-2xl shadow-xl transition-all transform hover:-translate-y-1">
+                                Play Again
+                            </button>
+                        ` : `
+                            <div class="inline-block bg-white/50 px-8 py-4 rounded-2xl text-slate-600 font-bold shadow-sm">
+                                Waiting for Host to play again...
+                            </div>
+                        `}
+                    </div>
+                </div>
+            `;
+        }
+
+        // ==========================================
+        // 5. EVENT LISTENERS & GAME LOOP
+        // ==========================================
+
+        function attachEventListeners() {
+            if (state.view === 'home') {
+                document.getElementById('btn-create').addEventListener('click', () => {
+                    const btn = document.getElementById('btn-create');
+                    btn.innerHTML = `<svg class="animate-spin h-5 w-5 mr-2" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Creating...`;
+                    initHost();
+                });
+                document.getElementById('btn-join').addEventListener('click', () => {
+                    const code = document.getElementById('input-room-code').value.trim();
+                    if (code.length !== 4) return showToast("Enter a 4-letter code", true);
+                    const btn = document.getElementById('btn-join');
+                    btn.innerText = '...';
+                    initGuest(code);
+                });
+            }
+            
+            if (state.view === 'lobby' && state.role === 'host') {
+                const btnStart = document.getElementById('btn-start');
+                if (btnStart) {
+                    btnStart.addEventListener('click', () => {
+                        const durInput = document.getElementById('input-duration');
+                        let dur = parseInt(durInput.value, 10);
+                        if (isNaN(dur) || dur < 30) dur = 120;
+                        
+                        state.board = generateBoard();
+                        state.duration = dur;
+                        
+                        sendNetworkMessage({
+                            type: 'start',
+                            board: state.board,
+                            duration: state.duration
+                        });
+                        
+                        // Start locally too
+                        state.myWords = [];
+                        state.oppWords = null;
+                        state.view = 'game';
+                        renderView();
+                        startGameTimer();
+                    });
+                }
+            }
+            
+            if (state.view === 'game') {
+                const input = document.getElementById('ui-word-input');
+                input.addEventListener('keypress', async (e) => {
+                    if (e.key === 'Enter') {
+                        const word = input.value.trim().toUpperCase();
+                        if (word) {
+                            input.value = '';
+                            await processWord(word);
+                        }
+                    }
+                });
+                if (window.innerWidth > 768) input.focus();
+            }
+            
+            if (state.view === 'results' && state.role === 'host') {
+                document.getElementById('btn-restart').addEventListener('click', () => {
+                    sendNetworkMessage({ type: 'restart' });
+                    state.myWords = [];
+                    state.oppWords = null;
+                    state.view = 'lobby';
+                    renderView();
+                });
+            }
+        }
+
+        async function processWord(word) {
+            const input = document.getElementById('ui-word-input');
+            const loading = document.getElementById('ui-loading');
+            
+            if (word.length < 3) return flashInputError("3 letters minimum");
+            if (state.myWords.includes(word)) return flashInputError("Already found");
+            if (!isValidPath(word, state.board)) return flashInputError("Not on board");
+
+            input.disabled = true;
+            loading.classList.remove('hidden');
+            
+            const isValid = await checkWordDictionary(word);
+            
+            loading.classList.add('hidden');
+            input.disabled = false;
+            if (window.innerWidth > 768) input.focus();
+
+            if (!isValid) return flashInputError("Not a valid word");
+
+            state.myWords.push(word);
+            updateWordListUI();
+        }
+
+        function flashInputError(msg) {
+            const input = document.getElementById('ui-word-input');
+            showToast(msg, true);
+            input.classList.add('shake', 'border-red-500', 'bg-red-50');
+            setTimeout(() => {
+                input.classList.remove('shake', 'border-red-500', 'bg-red-50');
+            }, 500);
+        }
+
+        function updateWordListUI() {
+            const listEl = document.getElementById('ui-word-list');
+            const countEl = document.getElementById('ui-word-count');
+            if (!listEl || !countEl) return;
+
+            countEl.textContent = state.myWords.length;
+            listEl.innerHTML = '';
+            
+            [...state.myWords].reverse().forEach(w => { // Show newest first
+                const el = document.createElement('span');
+                el.className = 'px-3 py-1.5 bg-slate-100 text-slate-800 border border-slate-200 rounded-lg text-sm font-bold shadow-sm pop-in';
+                el.textContent = w;
+                listEl.appendChild(el);
+            });
+        }
+
+        function startGameTimer() {
+            if (state.timerInterval) clearInterval(state.timerInterval);
+            
+            let timeLeft = state.duration;
+            const timerEl = document.getElementById('ui-timer');
+            
+            state.timerInterval = setInterval(() => {
+                timeLeft--;
+                if (timerEl) timerEl.textContent = formatTime(timeLeft);
+                
+                if (timeLeft <= 10 && timerEl && timeLeft > 0) {
+                    timerEl.classList.add('text-red-400', 'animate-pulse');
+                }
+
+                if (timeLeft <= 0) {
+                    clearInterval(state.timerInterval);
+                    finishGame();
+                }
+            }, 1000);
+        }
+
+        function finishGame() {
+            const input = document.getElementById('ui-word-input');
+            const overlay = document.getElementById('ui-end-overlay');
+            
+            if (input) input.disabled = true;
+            if (overlay) overlay.classList.remove('hidden');
+            if (overlay) overlay.classList.add('flex');
+            
+            // Send words to opponent
+            sendNetworkMessage({
+                type: 'words',
+                words: state.myWords
+            });
+            
+            // In case opponent finished fractionally earlier and already sent theirs
+            checkResultsReady();
+        }
+
+        function checkResultsReady() {
+            if (state.oppWords !== null) {
+                // We have both arrays
+                setTimeout(() => { // slight delay for dramatic effect
+                    state.view = 'results';
+                    renderView();
+                }, 1000);
+            }
+        }
+
+        // ==========================================
+        // INITIALIZATION
+        // ==========================================
+        renderView();
+
+    </script>
+</body>
+</html>
