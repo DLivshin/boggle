@@ -85,6 +85,7 @@
 
         const state = {
             view: 'home', // home, lobby, game, results
+            mode: null,   // 'single' or 'multi'
             role: null,   // 'host' or 'guest'
             peer: null,
             conn: null,
@@ -94,17 +95,16 @@
             timerInterval: null,
             myWords: [],
             oppWords: null, // null until received at the end
+            myFinishEarly: false,
+            oppFinishEarly: false,
             dictCache: {}
         };
 
+        // Robust PeerJS Config with Google STUN
         const peerConfig = {
-            host: '0.peerjs.com',
-            port: 443,
-            secure: true,
             config: {
                 'iceServers': [
-                    { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:stun1.l.google.com:19302' }
+                    { urls: 'stun:stun.l.google.com:19302' }
                 ]
             }
         };
@@ -164,7 +164,7 @@
                     state.dictCache[lowerWord] = false;
                     return false;
                 }
-                return true; // Optimistic fallback
+                return true; 
             } catch (e) {
                 return true; // Optimistic fallback on network error
             }
@@ -212,12 +212,21 @@
         // 3. PEERJS NETWORKING
         // ==========================================
 
+        function setupPeerReconnection() {
+            state.peer.on('disconnected', () => {
+                console.log("Disconnected from signaling server. Attempting reconnect...");
+                state.peer.reconnect();
+            });
+        }
+
         function initHost() {
             const code = generateRoomCode();
             state.roomCode = code;
             state.role = 'host';
             showToast("Connecting to signaling server...");
-            state.peer = new Peer(`BGL-${code}`, peerConfig); // Use explicit config
+            state.peer = new Peer(`BGL-${code}`, peerConfig);
+
+            setupPeerReconnection();
 
             state.peer.on('open', (id) => {
                 showToast("Host ready! Waiting for guest...");
@@ -227,13 +236,12 @@
 
             state.peer.on('connection', (connection) => {
                 if (state.conn) {
-                    // Reject subsequent connections
                     connection.on('open', () => connection.send({ type: 'error', msg: 'Room is full' }));
                     return;
                 }
                 state.conn = connection;
                 setupConnectionHandlers();
-                state.view = 'lobby'; // Re-render to show guest joined
+                state.view = 'lobby'; 
                 renderView();
             });
 
@@ -248,7 +256,9 @@
             state.roomCode = code;
             state.role = 'guest';
             showToast("Connecting to signaling server...");
-            state.peer = new Peer(peerConfig); // Use explicit config
+            state.peer = new Peer(peerConfig);
+
+            setupPeerReconnection();
 
             state.peer.on('open', (id) => {
                 showToast("Connecting to host...");
@@ -295,6 +305,8 @@
                     state.duration = data.duration;
                     state.myWords = [];
                     state.oppWords = null;
+                    state.myFinishEarly = false;
+                    state.oppFinishEarly = false;
                     state.view = 'game';
                     renderView();
                     startGameTimer();
@@ -302,6 +314,13 @@
                 case 'words':
                     state.oppWords = data.words;
                     checkResultsReady();
+                    break;
+                case 'finish_early':
+                    state.oppFinishEarly = true;
+                    showToast("Opponent finished early!");
+                    if (state.myFinishEarly && state.oppFinishEarly) {
+                        forceEndGame();
+                    }
                     break;
                 case 'restart':
                     state.myWords = [];
@@ -318,7 +337,7 @@
         }
 
         function sendNetworkMessage(payload) {
-            if (state.conn && state.conn.open) {
+            if (state.mode === 'multi' && state.conn && state.conn.open) {
                 state.conn.send(payload);
             }
         }
@@ -330,8 +349,14 @@
             state.conn = null;
             state.view = 'home';
             state.role = null;
+            state.mode = null;
             state.roomCode = null;
             renderView();
+        }
+
+        function forceEndGame() {
+            if (state.timerInterval) clearInterval(state.timerInterval);
+            finishGame();
         }
 
         // ==========================================
@@ -339,6 +364,13 @@
         // ==========================================
 
         function renderView() {
+            // Preserve duration input state before wiping DOM
+            const durInput = document.getElementById('input-duration');
+            if (durInput) {
+                const val = parseInt(durInput.value, 10);
+                if (!isNaN(val)) state.duration = val;
+            }
+
             if (state.view === 'home') DOM.innerHTML = getHomeHTML();
             else if (state.view === 'lobby') DOM.innerHTML = getLobbyHTML();
             else if (state.view === 'game') DOM.innerHTML = getGameHTML();
@@ -350,7 +382,6 @@
         function getHomeHTML() {
             return `
                 <div class="glass-panel w-full max-w-md p-10 rounded-[2rem] pop-in flex flex-col items-center relative overflow-hidden">
-                    <!-- Decor -->
                     <div class="absolute -top-20 -right-20 w-40 h-40 bg-fuchsia-500 rounded-full mix-blend-multiply filter blur-2xl opacity-50"></div>
                     <div class="absolute -bottom-20 -left-20 w-40 h-40 bg-indigo-500 rounded-full mix-blend-multiply filter blur-2xl opacity-50"></div>
                     
@@ -363,20 +394,24 @@
                         <h1 class="text-4xl font-black text-slate-800 mb-1 tracking-tight">Boggle</h1>
                         <p class="text-slate-500 font-medium mb-8">Boggle with Tzirel</p>
                         
-                        <button id="btn-create" class="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold text-lg py-4 px-6 rounded-2xl shadow-xl hover:shadow-2xl transition-all transform hover:-translate-y-1 mb-6 flex justify-center items-center gap-2">
-                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
-                            Create a Room
-                        </button>
+                        <div class="flex gap-2 mb-4">
+                            <button type="button" id="btn-solo" class="flex-1 bg-white hover:bg-slate-50 text-slate-800 border-2 border-slate-200 font-bold text-md py-3 px-4 rounded-2xl shadow-sm hover:shadow-md transition-all">
+                                Play Solo
+                            </button>
+                            <button type="button" id="btn-create" class="flex-1 bg-slate-900 hover:bg-slate-800 text-white font-bold text-md py-3 px-4 rounded-2xl shadow-xl hover:shadow-2xl transition-all">
+                                Create Room
+                            </button>
+                        </div>
                         
-                        <div class="flex items-center py-2 mb-6">
+                        <div class="flex items-center py-2 mb-4">
                             <div class="flex-grow border-t border-slate-200"></div>
                             <span class="mx-4 text-slate-400 font-bold text-xs uppercase tracking-widest">OR JOIN</span>
                             <div class="flex-grow border-t border-slate-200"></div>
                         </div>
                         
                         <div class="flex gap-2">
-                            <input type="text" id="input-room-code" placeholder="4-LETTER CODE" class="uppercase text-center w-full bg-slate-50 border-2 border-slate-200 text-slate-900 font-bold text-lg py-4 px-4 rounded-2xl focus:outline-none focus:border-indigo-500 focus:bg-white tracking-[0.2em] shadow-inner transition-colors">
-                            <button id="btn-join" class="bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-4 px-6 rounded-2xl shadow-lg transition-all transform hover:-translate-y-1">
+                            <input type="text" id="input-room-code" placeholder="4-LETTER CODE" class="uppercase text-center w-full bg-slate-50 border-2 border-slate-200 text-slate-900 font-bold text-lg py-3 px-4 rounded-2xl focus:outline-none focus:border-indigo-500 focus:bg-white tracking-[0.2em] shadow-inner transition-colors">
+                            <button type="button" id="btn-join" class="bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 px-6 rounded-2xl shadow-lg transition-all">
                                 Join
                             </button>
                         </div>
@@ -388,37 +423,42 @@
         function getLobbyHTML() {
             const isHost = state.role === 'host';
             const hasGuest = !!state.conn && state.conn.open;
+            const isSolo = state.mode === 'single';
             
             return `
                 <div class="glass-panel w-full max-w-md p-10 rounded-[2rem] pop-in text-center relative z-10">
-                    <h2 class="text-sm font-bold text-slate-400 uppercase tracking-widest mb-2">Your Room Code</h2>
-                    <div class="text-6xl font-black tracking-[0.1em] text-slate-800 mb-8 bg-white/50 py-6 rounded-2xl border-2 border-white/60 shadow-inner select-all">
-                        ${state.roomCode}
-                    </div>
-                    
-                    <div class="mb-8 space-y-3">
-                        <div class="flex items-center justify-between p-4 bg-white/60 border border-white/50 rounded-xl shadow-sm">
-                            <div class="flex items-center gap-3">
-                                <div class="w-3 h-3 rounded-full bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.8)]"></div>
-                                <span class="font-bold text-slate-700">You (${isHost ? 'Host' : 'Guest'})</span>
+                    ${!isSolo ? `
+                        <h2 class="text-sm font-bold text-slate-400 uppercase tracking-widest mb-2">Your Room Code</h2>
+                        <div class="text-6xl font-black tracking-[0.1em] text-slate-800 mb-8 bg-white/50 py-6 rounded-2xl border-2 border-white/60 shadow-inner select-all">
+                            ${state.roomCode}
+                        </div>
+                        
+                        <div class="mb-8 space-y-3">
+                            <div class="flex items-center justify-between p-4 bg-white/60 border border-white/50 rounded-xl shadow-sm">
+                                <div class="flex items-center gap-3">
+                                    <div class="w-3 h-3 rounded-full bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.8)]"></div>
+                                    <span class="font-bold text-slate-700">You (${isHost ? 'Host' : 'Guest'})</span>
+                                </div>
+                            </div>
+                            <div class="flex items-center justify-between p-4 bg-white/60 border border-white/50 rounded-xl shadow-sm">
+                                <div class="flex items-center gap-3">
+                                    <div class="w-3 h-3 rounded-full ${hasGuest ? 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.8)]' : 'bg-amber-400 animate-pulse'}"></div>
+                                    <span class="font-bold ${hasGuest ? 'text-slate-700' : 'text-slate-500'}">
+                                        ${hasGuest ? 'Opponent Joined' : 'Waiting for opponent...'}
+                                    </span>
+                                </div>
                             </div>
                         </div>
-                        <div class="flex items-center justify-between p-4 bg-white/60 border border-white/50 rounded-xl shadow-sm">
-                            <div class="flex items-center gap-3">
-                                <div class="w-3 h-3 rounded-full ${hasGuest ? 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.8)]' : 'bg-amber-400 animate-pulse'}"></div>
-                                <span class="font-bold ${hasGuest ? 'text-slate-700' : 'text-slate-500'}">
-                                    ${hasGuest ? 'Opponent Joined' : 'Waiting for opponent...'}
-                                </span>
-                            </div>
-                        </div>
-                    </div>
+                    ` : `
+                        <h2 class="text-2xl font-black text-slate-800 mb-8">Solo Practice</h2>
+                    `}
                     
                     ${isHost ? `
                         <div class="mb-6 bg-slate-50/80 p-4 rounded-2xl border border-slate-200/50">
                             <label class="block text-sm font-bold text-slate-600 mb-3 text-left">Match Duration (Seconds)</label>
-                            <input type="number" id="input-duration" value="${state.duration}" min="30" max="900" class="w-full bg-white border-2 border-slate-200 text-slate-900 font-bold text-xl rounded-xl py-3 px-4 focus:outline-none focus:border-indigo-500 shadow-inner">
+                            <input type="number" id="input-duration" value="${state.duration}" min="10" max="900" class="w-full bg-white border-2 border-slate-200 text-slate-900 font-bold text-xl rounded-xl py-3 px-4 focus:outline-none focus:border-indigo-500 shadow-inner">
                         </div>
-                        <button id="btn-start" ${!hasGuest ? 'disabled' : ''} class="w-full ${!hasGuest ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white shadow-xl hover:-translate-y-1'} font-black text-lg py-4 px-6 rounded-2xl transition-all transform">
+                        <button type="button" id="btn-start" ${(!hasGuest && !isSolo) ? 'disabled' : ''} class="w-full ${(!hasGuest && !isSolo) ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white shadow-xl hover:-translate-y-1'} font-black text-lg py-4 px-6 rounded-2xl transition-all transform">
                             START GAME
                         </button>
                     ` : `
@@ -465,17 +505,22 @@
                         
                         <div class="flex justify-between items-end mb-4 px-2">
                             <h3 class="font-black text-xl text-slate-800">Found Words <span id="ui-word-count" class="ml-2 bg-indigo-100 text-indigo-700 py-1 px-3 rounded-lg text-sm">0</span></h3>
-                            <span class="text-xs font-bold text-slate-500 uppercase tracking-widest">Opponent Hidden</span>
+                            ${state.mode === 'multi' ? `<span class="text-xs font-bold text-slate-500 uppercase tracking-widest">Opponent Hidden</span>` : ''}
                         </div>
                         
-                        <div class="bg-white/50 border border-white/60 shadow-inner rounded-2xl p-5 flex-grow overflow-y-auto relative">
-                            <div id="ui-word-list" class="flex flex-wrap gap-2 content-start">
+                        <div class="bg-white/50 border border-white/60 shadow-inner rounded-2xl p-5 flex-grow overflow-y-auto relative flex flex-col">
+                            <div id="ui-word-list" class="flex flex-wrap gap-2 content-start flex-grow">
                                 <!-- Words -->
                             </div>
+                            
+                            <button type="button" id="btn-finish-early" class="w-full mt-4 bg-slate-800 hover:bg-slate-700 text-white font-bold py-3 px-4 rounded-xl shadow-md transition-all uppercase tracking-widest text-sm flex-shrink-0">
+                                Finish Early
+                            </button>
+
                             <div id="ui-end-overlay" class="absolute inset-0 bg-slate-900/90 backdrop-blur-sm rounded-2xl hidden flex-col items-center justify-center text-white z-10 p-6 text-center">
                                 <svg class="animate-spin h-10 w-10 text-indigo-400 mb-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
                                 <h4 class="text-xl font-bold">Time's Up!</h4>
-                                <p class="text-slate-300 font-medium">Waiting for opponent data...</p>
+                                <p class="text-slate-300 font-medium">${state.mode === 'multi' ? 'Waiting for opponent data...' : 'Calculating score...'}</p>
                             </div>
                         </div>
                     </div>
@@ -484,6 +529,7 @@
         }
 
         function getResultsHTML() {
+            const isSolo = state.mode === 'single';
             const p1Words = state.myWords;
             const p2Words = state.oppWords || [];
             
@@ -498,7 +544,7 @@
             
             // Process My Words
             p1Words.forEach(w => {
-                if (p2Set.has(w)) {
+                if (!isSolo && p2Set.has(w)) {
                     p1Render.push(`<span class="px-3 py-1.5 bg-slate-200/50 text-slate-500 line-through rounded-lg text-sm font-semibold">${w} <span class="text-xs ml-1 opacity-50">0</span></span>`);
                 } else {
                     const pts = getWordScore(w);
@@ -508,28 +554,36 @@
             });
             
             // Process Opponent Words
-            p2Words.forEach(w => {
-                if (p1Set.has(w)) {
-                    p2Render.push(`<span class="px-3 py-1.5 bg-slate-200/50 text-slate-500 line-through rounded-lg text-sm font-semibold">${w} <span class="text-xs ml-1 opacity-50">0</span></span>`);
-                } else {
-                    const pts = getWordScore(w);
-                    p2Score += pts;
-                    p2Render.push(`<span class="px-3 py-1.5 bg-blue-100 text-blue-800 border border-blue-200 rounded-lg text-sm font-bold shadow-sm">${w} <span class="text-blue-600 bg-blue-200/50 px-1.5 rounded text-xs ml-1">+${pts}</span></span>`);
-                }
-            });
+            if (!isSolo) {
+                p2Words.forEach(w => {
+                    if (p1Set.has(w)) {
+                        p2Render.push(`<span class="px-3 py-1.5 bg-slate-200/50 text-slate-500 line-through rounded-lg text-sm font-semibold">${w} <span class="text-xs ml-1 opacity-50">0</span></span>`);
+                    } else {
+                        const pts = getWordScore(w);
+                        p2Score += pts;
+                        p2Render.push(`<span class="px-3 py-1.5 bg-blue-100 text-blue-800 border border-blue-200 rounded-lg text-sm font-bold shadow-sm">${w} <span class="text-blue-600 bg-blue-200/50 px-1.5 rounded text-xs ml-1">+${pts}</span></span>`);
+                    }
+                });
+            }
 
-            let winnerText = "It's a Tie!";
-            let winnerColor = "text-amber-400";
-            if (p1Score > p2Score) {
-                winnerText = "You Win! 🏆";
-                winnerColor = "text-green-400";
-            } else if (p2Score > p1Score) {
-                winnerText = "Opponent Wins! 💀";
-                winnerColor = "text-red-400";
+            let winnerText = "Well Done!";
+            let winnerColor = "text-green-400";
+            
+            if (!isSolo) {
+                if (p1Score > p2Score) {
+                    winnerText = "You Win! 🏆";
+                    winnerColor = "text-green-400";
+                } else if (p2Score > p1Score) {
+                    winnerText = "Opponent Wins! 💀";
+                    winnerColor = "text-red-400";
+                } else {
+                    winnerText = "It's a Tie!";
+                    winnerColor = "text-amber-400";
+                }
             }
 
             return `
-                <div class="glass-panel w-full max-w-5xl p-8 sm:p-12 rounded-[2rem] pop-in">
+                <div class="glass-panel w-full ${isSolo ? 'max-w-2xl' : 'max-w-5xl'} p-8 sm:p-12 rounded-[2rem] pop-in">
                     <div class="text-center mb-12">
                         <div class="inline-block bg-slate-900 px-8 py-3 rounded-full mb-6 shadow-xl border border-slate-700">
                             <h1 class="text-4xl sm:text-5xl font-black ${winnerColor} tracking-tight">${winnerText}</h1>
@@ -537,7 +591,7 @@
                         <p class="text-slate-600 font-bold uppercase tracking-widest">Final Post-Game Analysis</p>
                     </div>
                     
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-10">
+                    <div class="grid grid-cols-1 ${!isSolo ? 'md:grid-cols-2' : ''} gap-8 mb-10">
                         <!-- You -->
                         <div class="bg-white/80 rounded-[1.5rem] p-6 shadow-lg border-t-8 border-green-400 flex flex-col h-80">
                             <div class="flex justify-between items-end mb-6 pb-4 border-b-2 border-slate-100">
@@ -550,20 +604,22 @@
                         </div>
                         
                         <!-- Opponent -->
-                        <div class="bg-white/80 rounded-[1.5rem] p-6 shadow-lg border-t-8 border-blue-400 flex flex-col h-80">
-                            <div class="flex justify-between items-end mb-6 pb-4 border-b-2 border-slate-100">
-                                <h2 class="text-2xl font-black text-slate-800">Opponent</h2>
-                                <div class="text-5xl font-black text-blue-500 tracking-tighter">${p2Score}<span class="text-lg font-bold text-slate-400 ml-1">pts</span></div>
+                        ${!isSolo ? `
+                            <div class="bg-white/80 rounded-[1.5rem] p-6 shadow-lg border-t-8 border-blue-400 flex flex-col h-80">
+                                <div class="flex justify-between items-end mb-6 pb-4 border-b-2 border-slate-100">
+                                    <h2 class="text-2xl font-black text-slate-800">Opponent</h2>
+                                    <div class="text-5xl font-black text-blue-500 tracking-tighter">${p2Score}<span class="text-lg font-bold text-slate-400 ml-1">pts</span></div>
+                                </div>
+                                <div class="flex flex-wrap gap-2 overflow-y-auto content-start flex-grow pr-2">
+                                    ${p2Render.length ? p2Render.join('') : '<span class="text-slate-400 font-medium italic w-full text-center mt-10">No words found.</span>'}
+                                </div>
                             </div>
-                            <div class="flex flex-wrap gap-2 overflow-y-auto content-start flex-grow pr-2">
-                                ${p2Render.length ? p2Render.join('') : '<span class="text-slate-400 font-medium italic w-full text-center mt-10">No words found.</span>'}
-                            </div>
-                        </div>
+                        ` : ''}
                     </div>
                     
-                    <div class="text-center">
+                    <div class="text-center flex justify-center gap-4">
                         ${state.role === 'host' ? `
-                            <button id="btn-restart" class="bg-slate-900 hover:bg-slate-800 text-white font-bold text-xl py-4 px-10 rounded-2xl shadow-xl transition-all transform hover:-translate-y-1">
+                            <button type="button" id="btn-restart" class="bg-slate-900 hover:bg-slate-800 text-white font-bold text-xl py-4 px-10 rounded-2xl shadow-xl transition-all transform hover:-translate-y-1">
                                 Play Again
                             </button>
                         ` : `
@@ -571,6 +627,9 @@
                                 Waiting for Host to play again...
                             </div>
                         `}
+                        <button type="button" id="btn-home" class="bg-white hover:bg-slate-50 text-slate-800 border-2 border-slate-200 font-bold text-xl py-4 px-8 rounded-2xl shadow-sm transition-all transform hover:-translate-y-1">
+                            Quit
+                        </button>
                     </div>
                 </div>
             `;
@@ -581,13 +640,24 @@
         // ==========================================
 
         function attachEventListeners() {
+            // Home Listeners
             if (state.view === 'home') {
+                document.getElementById('btn-solo').addEventListener('click', () => {
+                    state.mode = 'single';
+                    state.role = 'host';
+                    state.view = 'lobby';
+                    renderView();
+                });
+                
                 document.getElementById('btn-create').addEventListener('click', () => {
+                    state.mode = 'multi';
                     const btn = document.getElementById('btn-create');
-                    btn.innerHTML = `<svg class="animate-spin h-5 w-5 mr-2" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Creating...`;
+                    btn.innerHTML = `<svg class="animate-spin h-5 w-5 mr-2 inline" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Creating...`;
                     initHost();
                 });
+                
                 document.getElementById('btn-join').addEventListener('click', () => {
+                    state.mode = 'multi';
                     const code = document.getElementById('input-room-code').value.trim().toUpperCase();
                     if (code.length !== 4) return showToast("Enter a 4-letter code", true);
                     const btn = document.getElementById('btn-join');
@@ -596,26 +666,38 @@
                 });
             }
             
+            // Lobby Listeners
             if (state.view === 'lobby' && state.role === 'host') {
                 const btnStart = document.getElementById('btn-start');
+                const durInput = document.getElementById('input-duration');
+                
+                if (durInput) {
+                    durInput.addEventListener('input', (e) => {
+                        const val = parseInt(e.target.value, 10);
+                        if (!isNaN(val)) state.duration = val;
+                    });
+                }
+                
                 if (btnStart) {
                     btnStart.addEventListener('click', () => {
-                        const durInput = document.getElementById('input-duration');
                         let dur = parseInt(durInput.value, 10);
-                        if (isNaN(dur) || dur < 30) dur = 120;
+                        if (isNaN(dur) || dur < 10) dur = 120;
                         
                         state.board = generateBoard();
                         state.duration = dur;
                         
-                        sendNetworkMessage({
-                            type: 'start',
-                            board: state.board,
-                            duration: state.duration
-                        });
+                        if (state.mode === 'multi') {
+                            sendNetworkMessage({
+                                type: 'start',
+                                board: state.board,
+                                duration: state.duration
+                            });
+                        }
                         
-                        // Start locally too
                         state.myWords = [];
                         state.oppWords = null;
+                        state.myFinishEarly = false;
+                        state.oppFinishEarly = false;
                         state.view = 'game';
                         renderView();
                         startGameTimer();
@@ -623,10 +705,14 @@
                 }
             }
             
+            // Game Listeners
             if (state.view === 'game') {
                 const input = document.getElementById('ui-word-input');
+                const btnFinish = document.getElementById('btn-finish-early');
+
                 input.addEventListener('keypress', async (e) => {
                     if (e.key === 'Enter') {
+                        e.preventDefault(); 
                         const word = input.value.trim().toUpperCase();
                         if (word) {
                             input.value = '';
@@ -634,17 +720,47 @@
                         }
                     }
                 });
+                
                 if (window.innerWidth > 768) input.focus();
+
+                if (btnFinish) {
+                    btnFinish.addEventListener('click', () => {
+                        state.myFinishEarly = true;
+                        btnFinish.textContent = state.mode === 'multi' ? "Waiting for opponent..." : "Finishing...";
+                        btnFinish.disabled = true;
+                        btnFinish.classList.add('opacity-50', 'cursor-not-allowed');
+
+                        if (state.mode === 'single') {
+                            forceEndGame();
+                        } else {
+                            sendNetworkMessage({ type: 'finish_early' });
+                            if (state.myFinishEarly && state.oppFinishEarly) {
+                                forceEndGame();
+                            }
+                        }
+                    });
+                }
             }
             
-            if (state.view === 'results' && state.role === 'host') {
-                document.getElementById('btn-restart').addEventListener('click', () => {
-                    sendNetworkMessage({ type: 'restart' });
-                    state.myWords = [];
-                    state.oppWords = null;
-                    state.view = 'lobby';
-                    renderView();
-                });
+            // Results Listeners
+            if (state.view === 'results') {
+                const btnRestart = document.getElementById('btn-restart');
+                const btnHome = document.getElementById('btn-home');
+                
+                if (btnRestart && state.role === 'host') {
+                    btnRestart.addEventListener('click', () => {
+                        if (state.mode === 'multi') sendNetworkMessage({ type: 'restart' });
+                        state.myWords = [];
+                        state.oppWords = null;
+                        state.view = 'lobby';
+                        renderView();
+                    });
+                }
+                if (btnHome) {
+                    btnHome.addEventListener('click', () => {
+                        resetState();
+                    });
+                }
             }
         }
 
@@ -711,8 +827,7 @@
                 }
 
                 if (timeLeft <= 0) {
-                    clearInterval(state.timerInterval);
-                    finishGame();
+                    forceEndGame();
                 }
             }, 1000);
         }
@@ -720,24 +835,32 @@
         function finishGame() {
             const input = document.getElementById('ui-word-input');
             const overlay = document.getElementById('ui-end-overlay');
+            const btnFinish = document.getElementById('btn-finish-early');
             
             if (input) input.disabled = true;
-            if (overlay) overlay.classList.remove('hidden');
-            if (overlay) overlay.classList.add('flex');
+            if (btnFinish) btnFinish.disabled = true;
+            if (overlay) {
+                overlay.classList.remove('hidden');
+                overlay.classList.add('flex');
+            }
             
-            // Send words to opponent
-            sendNetworkMessage({
-                type: 'words',
-                words: state.myWords
-            });
+            if (state.mode === 'multi') {
+                sendNetworkMessage({
+                    type: 'words',
+                    words: state.myWords
+                });
+            }
             
-            // In case opponent finished fractionally earlier and already sent theirs
             checkResultsReady();
         }
 
         function checkResultsReady() {
-            if (state.oppWords !== null) {
-                // We have both arrays
+            if (state.mode === 'single') {
+                setTimeout(() => {
+                    state.view = 'results';
+                    renderView();
+                }, 1000);
+            } else if (state.oppWords !== null) {
                 setTimeout(() => { // slight delay for dramatic effect
                     state.view = 'results';
                     renderView();
