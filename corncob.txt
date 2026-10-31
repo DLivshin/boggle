@@ -1191,7 +1191,6 @@ airconditioning
 aircraft
 aircrew
 aircrews
-aire
 aired
 airfield
 airfields
@@ -16310,7 +16309,6 @@ eightpence
 eights
 eighty
 einstein
-eire
 eisteddfod
 either
 eject
@@ -47299,6 +47297,7 @@ snorted
 snorting
 snorts
 snotty
+snot
 snout
 snouts
 snow
