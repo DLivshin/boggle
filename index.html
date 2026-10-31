@@ -112,7 +112,7 @@
         async function loadDictionary() {
             try {
                 // Fetching a comprehensive dictionary
-                const res = await fetch('https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt');
+                const res = await fetch('https://raw.githubusercontent.com/dolph/dictionary/master/enable1.txt');
                 const text = await res.text();
                 const words = text.split(/\r?\n/);
                 
@@ -154,6 +154,7 @@
             roomCode: null,
             board: [],
             duration: 120,
+            allow3Letter: true,
             timerInterval: null,
             myWords: [],
             oppWords: null, 
@@ -199,7 +200,8 @@
                 }
                 
                 const newWordStr = wordStr + letterStr;
-                if (currNode.isWord && newWordStr.length >= 3) {
+                const minLen = state.allow3Letter ? 3 : 4;
+                if (currNode.isWord && newWordStr.length >= minLen) {
                     validFound.add(newWordStr);
                 }
                 
@@ -354,6 +356,7 @@
                     sendMQTT(state.guestTopic, 'lobby_state', { 
                         view: state.view, 
                         duration: state.duration, 
+                        allow3Letter: state.allow3Letter,
                         board: state.board 
                     });
                 }
@@ -377,6 +380,7 @@
                     }
                     
                     state.duration = data.payload.duration;
+                    state.allow3Letter = data.payload.allow3Letter;
                     if (state.view !== data.payload.view) {
                         state.view = data.payload.view;
                         if (state.view === 'game') {
@@ -390,6 +394,7 @@
                 if (data.type === 'start' || data.type === 'rescramble') {
                     state.board = data.payload.board;
                     state.duration = data.payload.duration;
+                    state.allow3Letter = data.payload.allow3Letter;
                     state.currentBoardValidWords = solveBoard(state.board); 
                     state.myWords = [];
                     state.oppWords = null;
@@ -470,6 +475,10 @@
             const durInput = document.getElementById('input-duration');
             if (durInput && !isNaN(parseInt(durInput.value, 10))) {
                 state.duration = parseInt(durInput.value, 10);
+            }
+            const allow3Input = document.getElementById('input-allow-3');
+            if (allow3Input) {
+                state.allow3Letter = allow3Input.checked;
             }
 
             if (state.view === 'home') DOM.innerHTML = getHomeHTML();
@@ -557,7 +566,12 @@
                     ${isHost ? `
                         <div class="mb-6 bg-slate-900/50 p-4 rounded-2xl border border-slate-700">
                             <label class="block text-sm font-bold text-slate-400 mb-3 text-left">Timer Duration (Seconds)</label>
-                            <input type="number" id="input-duration" value="${state.duration}" min="10" max="900" class="glass-input w-full font-bold text-xl rounded-xl py-3 px-4 shadow-inner">
+                            <input type="number" id="input-duration" value="${state.duration}" min="10" max="900" class="glass-input w-full font-bold text-xl rounded-xl py-3 px-4 shadow-inner mb-4">
+                            
+                            <label class="flex items-center gap-3 cursor-pointer">
+                                <input type="checkbox" id="input-allow-3" ${state.allow3Letter ? 'checked' : ''} class="w-5 h-5 rounded border-slate-600 text-violet-600 focus:ring-violet-600 bg-slate-800">
+                                <span class="text-sm font-bold text-slate-300">Allow 3-Letter Words</span>
+                            </label>
                         </div>
                         <button type="button" id="btn-start" ${(!hasGuest && !isSolo) ? 'disabled' : ''} class="w-full ${(!hasGuest && !isSolo) ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-white shadow-lg hover:shadow-fuchsia-500/25'} font-black text-lg py-4 px-6 rounded-xl transition-all">
                             START GAME
@@ -675,11 +689,11 @@
 
             // Group Missed Words
             const missedWords = state.currentBoardValidWords.filter(w => !allFoundSet.has(w));
-            const missedGroups = { 3: [], 4: [], 5: [], 6: [] };
+            const missedGroups = { 3: [], 4: [], 5: [], 6: [], 7: [], 8: [], 9: [] };
             
             missedWords.forEach(w => {
                 const len = w.length;
-                if (len >= 6) missedGroups[6].push(w);
+                if (len >= 9) missedGroups[9].push(w);
                 else missedGroups[len].push(w);
             });
 
@@ -752,11 +766,13 @@
                         </h3>
                         <div class="overflow-y-auto pr-2 flex-grow">
                             ${missedWords.length ? `
-                                ${renderMissedGroup('3 Letters', missedGroups[3])}
-                                ${renderMissedGroup('6+ Letters', missedGroups[4])}
+                                ${renderMissedGroup('9+ Letters', missedGroups[9])}
+                                ${renderMissedGroup('8 Letters', missedGroups[8])}
+                                ${renderMissedGroup('7 Letters', missedGroups[7])}
+                                ${renderMissedGroup('6 Letters', missedGroups[6])}
                                 ${renderMissedGroup('5 Letters', missedGroups[5])}
-                                ${renderMissedGroup('4 Letters', missedGroups[6])}
-                                
+                                ${renderMissedGroup('4 Letters', missedGroups[4])}
+                                ${renderMissedGroup('3 Letters', missedGroups[3])}
                             ` : '<span class="text-slate-500 font-medium italic block text-center mt-4">Wow, you found every possible word!</span>'}
                         </div>
                     </div>
@@ -879,14 +895,18 @@
             let dur = parseInt(document.getElementById('input-duration')?.value || state.duration, 10);
             if (isNaN(dur) || dur < 10) dur = 120;
             
+            const allow3 = document.getElementById('input-allow-3') ? document.getElementById('input-allow-3').checked : state.allow3Letter;
+            
             state.board = generateBoard();
             state.duration = dur;
+            state.allow3Letter = allow3;
             state.currentBoardValidWords = solveBoard(state.board);
             
             if (state.mode === 'multi') {
                 sendMQTT(state.guestTopic, networkType, {
                     board: state.board,
-                    duration: state.duration
+                    duration: state.duration,
+                    allow3Letter: state.allow3Letter
                 });
             }
             
@@ -906,8 +926,9 @@
 
         function processWord(word) {
             const input = document.getElementById('ui-word-input');
+            const minLen = state.allow3Letter ? 3 : 4;
             
-            if (word.length < 3) return flashInputError("Too short! (Min 3 letters)");
+            if (word.length < minLen) return flashInputError(`Too short! (Min ${minLen} letters)`);
             if (state.myWords.includes(word)) return flashInputError("Already found!");
             
             // Intelligent Validation requested in prompt
