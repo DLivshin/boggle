@@ -50959,6 +50959,7 @@ tarantulas
 tardily
 tardiness
 tardy
+tare
 tares
 target
 targeted
