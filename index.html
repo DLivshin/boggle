@@ -159,6 +159,7 @@
             oppWords: null, 
             myFinishEarly: false,
             oppFinishEarly: false,
+            isFinished: false,
             currentBoardValidWords: [], 
             
             // MQTT State
@@ -167,7 +168,8 @@
             hostTopic: null,
             guestTopic: null,
             guestConnected: false,
-            joinInterval: null
+            joinInterval: null,
+            wordsInterval: null
         };
 
         const DOM = document.getElementById('app');
@@ -437,6 +439,7 @@
         function resetState() {
             if (state.timerInterval) clearInterval(state.timerInterval);
             if (state.joinInterval) clearInterval(state.joinInterval);
+            if (state.wordsInterval) clearInterval(state.wordsInterval);
             if (state.mqttClient) {
                 state.mqttClient.end();
                 state.mqttClient = null;
@@ -448,6 +451,7 @@
             state.hostTopic = null;
             state.guestTopic = null;
             state.guestConnected = false;
+            state.isFinished = false;
             renderView();
         }
 
@@ -489,7 +493,7 @@
                             </div>
                         </div>
                         <h1 class="text-4xl font-black text-white mb-1 tracking-tight">Boggle</h1>
-                        <p class="text-violet-300 font-medium mb-8">Boogle :)</p>
+                        <p class="text-violet-300 font-medium mb-8">Boggle with Tzirel</p>
                         
                         <div class="flex gap-3 mb-6">
                             <button type="button" id="btn-solo" class="flex-1 bg-slate-800/80 hover:bg-slate-700 text-white border border-slate-600 font-bold py-3 px-4 rounded-xl shadow-lg transition-all">
@@ -843,7 +847,8 @@
                         if (state.mode === 'single') {
                             forceEndGame();
                         } else {
-                            sendMQTT(state.guestTopic, 'finish_early');
+                            const targetTopic = state.role === 'host' ? state.guestTopic : state.hostTopic;
+                            sendMQTT(targetTopic, 'finish_early');
                             if (state.myFinishEarly && state.oppFinishEarly) forceEndGame();
                         }
                     });
@@ -888,6 +893,11 @@
             state.oppWords = null;
             state.myFinishEarly = false;
             state.oppFinishEarly = false;
+            state.isFinished = false;
+            if (state.wordsInterval) {
+                clearInterval(state.wordsInterval);
+                state.wordsInterval = null;
+            }
             state.view = 'game';
             renderView();
             startGameTimer();
@@ -963,8 +973,23 @@
                 overlay.classList.add('flex');
             }
             
+            state.isFinished = true;
+            
             if (state.mode === 'multi') {
                 const targetTopic = state.role === 'host' ? state.guestTopic : state.hostTopic;
+                
+                if (state.wordsInterval) clearInterval(state.wordsInterval);
+                
+                // Persistent knock for end-game words exchange
+                state.wordsInterval = setInterval(() => {
+                    sendMQTT(targetTopic, 'words', { words: state.myWords });
+                    if (state.oppWords !== null) {
+                        clearInterval(state.wordsInterval);
+                        state.wordsInterval = null;
+                    }
+                }, 1000);
+                
+                // Initial send
                 sendMQTT(targetTopic, 'words', { words: state.myWords });
             }
             
@@ -972,7 +997,19 @@
         }
 
         function checkResultsReady() {
-            if (state.mode === 'single' || state.oppWords !== null) {
+            if (state.mode === 'single') {
+                setTimeout(() => {
+                    state.view = 'results';
+                    renderView();
+                }, 1000); 
+                return;
+            }
+
+            if (state.isFinished && state.oppWords !== null) {
+                if (state.wordsInterval) {
+                    clearInterval(state.wordsInterval);
+                    state.wordsInterval = null;
+                }
                 setTimeout(() => {
                     state.view = 'results';
                     renderView();
