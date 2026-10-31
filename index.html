@@ -73,7 +73,22 @@
                         inset -2px -2px 4px rgba(0,0,0,0.5),
                         0 8px 16px rgba(0,0,0,0.4);
             text-shadow: 0 2px 4px rgba(0,0,0,0.5);
-            transition: transform 0.1s ease;
+            transition: all 0.15s ease;
+        }
+
+        .boggle-die-selected {
+            background: linear-gradient(145deg, #7c3aed, #4c1d95) !important;
+            border-color: #c084fc !important;
+            box-shadow: 0 0 20px rgba(168, 85, 247, 0.6), inset 0 0 10px rgba(255,255,255,0.2) !important;
+            transform: scale(0.96);
+        }
+
+        .word-trace-item {
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .word-trace-item:hover {
+            transform: translateY(-1px);
         }
     </style>
 </head>
@@ -90,7 +105,7 @@
         <div class="glass-panel p-10 rounded-[2rem] flex flex-col items-center justify-center text-center pop-in w-full max-w-md">
             <svg class="animate-spin h-12 w-12 text-violet-500 mb-6" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
             <h2 class="text-2xl font-bold text-white mb-2">Loading Dictionary...</h2>
-            <p class="text-slate-400 text-sm">Downloading extensive word list and building syntax trees. This takes a few seconds.</p>
+            <p class="text-slate-400 text-sm">Downloading word list and building syntax trees. This takes a few seconds.</p>
         </div>
     </div>
 
@@ -111,8 +126,14 @@
 
         async function loadDictionary() {
             try {
-                // Fetching a comprehensive dictionary
-                const res = await fetch('./corncob.txt');
+                let res;
+                try {
+                    res = await fetch('./corncob.txt');
+                    if (!res.ok) throw new Error();
+                } catch {
+                    res = await fetch('https://raw.githubusercontent.com/pjackowski/passphrase-gen/master/corncob-lowercase.txt');
+                }
+
                 const text = await res.text();
                 const words = text.split(/\r?\n/);
                 
@@ -120,7 +141,6 @@
                     const upper = w.trim().toUpperCase();
                     if (upper.length >= 3) {
                         fullDictionarySet.add(upper);
-                        // Insert into Trie
                         let node = trieRoot;
                         for (let char of upper) {
                             if (!node.children[char]) node.children[char] = new TrieNode();
@@ -153,7 +173,7 @@
             role: null,   
             roomCode: null,
             board: [],
-            duration: 120,
+            duration: 180,
             allow3Letter: true,
             timerInterval: null,
             myWords: [],
@@ -162,6 +182,8 @@
             oppFinishEarly: false,
             isFinished: false,
             currentBoardValidWords: [], 
+            wordPaths: new Map(), // word -> [diceIndex0, diceIndex1, ...]
+            selectedDice: [],    // Live board clicking selection path
             
             // MQTT State
             mqttClient: null,
@@ -184,13 +206,14 @@
         }
 
         function solveBoard(boardArray) {
+            state.wordPaths = new Map();
             const validFound = new Set();
             const grid = [];
             for(let i=0; i<4; i++) grid.push(boardArray.slice(i*4, i*4+4));
             
             const dirs = [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]];
 
-            function dfs(r, c, node, wordStr, visited) {
+            function dfs(r, c, node, wordStr, visited, pathIndices) {
                 let letterStr = grid[r][c] === 'Q' ? 'QU' : grid[r][c];
                 let currNode = node;
                 
@@ -200,16 +223,21 @@
                 }
                 
                 const newWordStr = wordStr + letterStr;
+                const newPath = [...pathIndices, r * 4 + c];
                 const minLen = state.allow3Letter ? 3 : 4;
+
                 if (currNode.isWord && newWordStr.length >= minLen) {
                     validFound.add(newWordStr);
+                    if (!state.wordPaths.has(newWordStr)) {
+                        state.wordPaths.set(newWordStr, newPath);
+                    }
                 }
                 
                 visited[r][c] = true;
                 for(let [dr, dc] of dirs) {
                     let nr = r + dr, nc = c + dc;
                     if(nr >= 0 && nr < 4 && nc >= 0 && nc < 4 && !visited[nr][nc]) {
-                        dfs(nr, nc, currNode, newWordStr, visited);
+                        dfs(nr, nc, currNode, newWordStr, visited, newPath);
                     }
                 }
                 visited[r][c] = false;
@@ -218,7 +246,7 @@
             for(let r=0; r<4; r++) {
                 for(let c=0; c<4; c++) {
                     let visited = Array(4).fill(0).map(() => Array(4).fill(false));
-                    dfs(r, c, trieRoot, "", visited);
+                    dfs(r, c, trieRoot, "", visited, []);
                 }
             }
             return Array.from(validFound).sort();
@@ -263,7 +291,7 @@
         }
 
         // ==========================================
-        // 4. ROBUST MQTT NETWORKING (HiveMQ)
+        // 4. MQTT NETWORKING (HiveMQ)
         // ==========================================
         function initHost() {
             state.roomCode = generateRoomCode();
@@ -291,7 +319,6 @@
 
             state.mqttClient.on('connect', () => {
                 if (state.role === 'host') {
-                    // HOST subscribes to the host topic to listen for guests
                     state.mqttClient.subscribe(state.hostTopic, { qos: 1 }, (err) => {
                         if (!err) {
                             showToast("Room created! Waiting for guest...");
@@ -302,15 +329,12 @@
                         }
                     });
                 } else if (state.role === 'guest') {
-                    // GUEST subscribes to guest topic FIRST to ensure it catches the reply
                     state.mqttClient.subscribe(state.guestTopic, { qos: 1 }, (err) => {
                         if (!err) {
                             showToast("Looking for host...");
-                            // RACE CONDITION FIX: Continually pulse 'join' to host until acknowledged
                             state.joinInterval = setInterval(() => {
                                 sendMQTT(state.hostTopic, 'join');
                             }, 1500);
-                            // Initial immediate attempt
                             sendMQTT(state.hostTopic, 'join');
                         } else {
                             handleConnectionError();
@@ -344,7 +368,6 @@
         }
 
         function handleNetworkMessage(topic, data) {
-            // HOST logic
             if (state.role === 'host' && topic === state.hostTopic) {
                 if (data.type === 'join') {
                     if (!state.guestConnected) {
@@ -352,7 +375,6 @@
                         showToast("Opponent Joined!");
                         renderView();
                     }
-                    // Always reply to joins with lobby state so guest can clear their interval
                     sendMQTT(state.guestTopic, 'lobby_state', { 
                         view: state.view, 
                         duration: state.duration, 
@@ -369,10 +391,8 @@
                 }
             }
 
-            // GUEST logic
             if (state.role === 'guest' && topic === state.guestTopic) {
                 if (data.type === 'lobby_state') {
-                    // We received acknowledgment! Clear the retry interval.
                     if (state.joinInterval) {
                         clearInterval(state.joinInterval);
                         state.joinInterval = null;
@@ -400,6 +420,7 @@
                     state.oppWords = null;
                     state.myFinishEarly = false;
                     state.oppFinishEarly = false;
+                    state.selectedDice = [];
                     state.view = 'game';
                     renderView();
                     startGameTimer();
@@ -415,6 +436,7 @@
                 if (data.type === 'restart') {
                     state.myWords = [];
                     state.oppWords = null;
+                    state.selectedDice = [];
                     state.view = 'lobby';
                     renderView();
                     showToast("Host returned to lobby.");
@@ -457,6 +479,7 @@
             state.guestTopic = null;
             state.guestConnected = false;
             state.isFinished = false;
+            state.selectedDice = [];
             renderView();
         }
 
@@ -471,7 +494,6 @@
         function renderView() {
             if (!dictionaryLoaded) return; 
 
-            // Preserve duration input state on re-renders
             const durInput = document.getElementById('input-duration');
             if (durInput && !isNaN(parseInt(durInput.value, 10))) {
                 state.duration = parseInt(durInput.value, 10);
@@ -573,15 +595,19 @@
                                 <span class="text-sm font-bold text-slate-300">Allow 3-Letter Words</span>
                             </label>
                         </div>
-                        <button type="button" id="btn-start" ${(!hasGuest && !isSolo) ? 'disabled' : ''} class="w-full ${(!hasGuest && !isSolo) ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-white shadow-lg hover:shadow-fuchsia-500/25'} font-black text-lg py-4 px-6 rounded-xl transition-all">
+                        <button type="button" id="btn-start" ${(!hasGuest && !isSolo) ? 'disabled' : ''} class="w-full ${(!hasGuest && !isSolo) ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-white shadow-lg hover:shadow-fuchsia-500/25'} font-black text-lg py-4 px-6 rounded-xl transition-all mb-3">
                             START GAME
                         </button>
                     ` : `
-                        <div class="p-6 bg-slate-800/50 border border-slate-700 rounded-2xl text-violet-400 font-bold flex flex-col items-center gap-3">
+                        <div class="p-6 bg-slate-800/50 border border-slate-700 rounded-2xl text-violet-400 font-bold flex flex-col items-center gap-3 mb-4">
                             <svg class="animate-spin h-8 w-8 text-violet-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
                             Waiting for Host to start...
                         </div>
                     `}
+                    
+                    <button type="button" id="btn-lobby-back" class="w-full bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-600 font-bold py-3.5 px-4 rounded-xl transition-all">
+                        Back to Menu
+                    </button>
                 </div>
             `;
         }
@@ -602,10 +628,11 @@
                             </div>
                         </div>
                         
+                        <!-- 4x4 Clickable Game Board -->
                         <div class="grid grid-cols-4 gap-3 sm:gap-4 bg-slate-900 p-4 sm:p-6 rounded-[1.5rem] shadow-2xl border border-slate-700 select-none w-full max-w-[24rem]">
-                            ${state.board.map(letter => {
+                            ${state.board.map((letter, idx) => {
                                 const display = letter === 'Q' ? 'Qu' : letter;
-                                return `<div class="boggle-die aspect-square rounded-xl flex items-center justify-center text-4xl sm:text-5xl font-black text-white uppercase">${display}</div>`;
+                                return `<div id="game-die-${idx}" onclick="handleDieClick(${idx})" class="boggle-die aspect-square rounded-xl flex items-center justify-center text-4xl sm:text-5xl font-black text-white uppercase cursor-pointer select-none">${display}</div>`;
                             }).join('')}
                         </div>
 
@@ -619,8 +646,13 @@
                     
                     <!-- Right: Input & Words -->
                     <div class="flex-1 flex flex-col h-[32rem]">
-                        <div class="relative w-full mb-6">
-                            <input type="text" id="ui-word-input" placeholder="Type word & press Enter" class="glass-input w-full font-black text-xl py-4 px-6 rounded-xl uppercase tracking-widest transition-all" autocomplete="off" autocorrect="off" spellcheck="false">
+                        <!-- Input with Submit Button -->
+                        <div class="flex gap-2 w-full mb-6">
+                            <input type="text" id="ui-word-input" placeholder="Type or click letters..." class="glass-input flex-1 font-black text-xl py-4 px-6 rounded-xl uppercase tracking-widest transition-all" autocomplete="off" autocorrect="off" spellcheck="false">
+                            <button type="button" id="btn-submit-word" class="bg-violet-600 hover:bg-violet-500 active:scale-95 text-white font-bold px-6 py-4 rounded-xl shadow-lg hover:shadow-violet-500/25 transition-all flex items-center justify-center gap-1.5 flex-shrink-0">
+                                <span class="hidden sm:inline text-sm uppercase tracking-wider">Submit</span>
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M14 5l7 7m0 0l-7 7m7-7H3"/></svg>
+                            </button>
                         </div>
                         
                         <div class="flex justify-between items-end mb-4 px-2 border-b border-slate-700 pb-2">
@@ -648,6 +680,104 @@
             `;
         }
 
+        // --- Interactive Click-to-Select Mechanics ---
+        function handleDieClick(idx) {
+            const input = document.getElementById('ui-word-input');
+            const dieEl = document.getElementById(`game-die-${idx}`);
+            if (!input || !dieEl) return;
+
+            // If die is already selected
+            const pos = state.selectedDice.indexOf(idx);
+            if (pos !== -1) {
+                // If it is the last selected die, backtrack / unselect!
+                if (pos === state.selectedDice.length - 1) {
+                    state.selectedDice.pop();
+                    updateInputFromSelectedDice();
+                    updateBoardDiceHighlights();
+                    return;
+                }
+                flashDieShake(dieEl);
+                focusInputField();
+                return;
+            }
+
+            // If first letter in path
+            if (state.selectedDice.length === 0) {
+                state.selectedDice.push(idx);
+                updateInputFromSelectedDice();
+                updateBoardDiceHighlights();
+                return;
+            }
+
+            // Check adjacency with the last selected die
+            const lastIdx = state.selectedDice[state.selectedDice.length - 1];
+            const r1 = Math.floor(lastIdx / 4), c1 = lastIdx % 4;
+            const r2 = Math.floor(idx / 4), c2 = idx % 4;
+            const isAdjacent = Math.abs(r1 - r2) <= 1 && Math.abs(c1 - c2) <= 1 && !(r1 === r2 && c1 === c2);
+
+            if (isAdjacent) {
+                state.selectedDice.push(idx);
+                updateInputFromSelectedDice();
+                updateBoardDiceHighlights();
+            } else {
+                flashDieShake(dieEl);
+                focusInputField();
+            }
+        }
+
+        function flashDieShake(el) {
+            el.classList.add('shake', 'border-red-500');
+            setTimeout(() => el.classList.remove('shake', 'border-red-500'), 400);
+        }
+
+        function focusInputField() {
+            const input = document.getElementById('ui-word-input');
+            if (input) {
+                input.focus();
+                input.setSelectionRange(input.value.length, input.value.length);
+            }
+        }
+
+        function updateInputFromSelectedDice() {
+            const input = document.getElementById('ui-word-input');
+            if (!input) return;
+            const word = state.selectedDice.map(i => state.board[i] === 'Q' ? 'QU' : state.board[i]).join('');
+            input.value = word;
+            focusInputField();
+        }
+
+        function updateBoardDiceHighlights() {
+            for (let i = 0; i < 16; i++) {
+                const el = document.getElementById(`game-die-${i}`);
+                if (!el) continue;
+                if (state.selectedDice.includes(i)) {
+                    el.classList.add('boggle-die-selected');
+                } else {
+                    el.classList.remove('boggle-die-selected');
+                }
+            }
+        }
+
+        function clearSelectedDice() {
+            state.selectedDice = [];
+            updateBoardDiceHighlights();
+        }
+
+        function submitCurrentWord() {
+            const input = document.getElementById('ui-word-input');
+            if (!input) return;
+            const word = input.value.trim().toUpperCase();
+            if (word) {
+                input.value = '';
+                clearSelectedDice();
+                processWord(word);
+            }
+            focusInputField();
+        }
+
+        // ==========================================
+        // 6. RESULTS & TRACING ENGINE
+        // ==========================================
         function getResultsHTML() {
             const isSolo = state.mode === 'single';
             const p1Words = state.myWords;
@@ -666,11 +796,11 @@
             // Process My Words
             p1Words.forEach(w => {
                 if (!isSolo && p2Set.has(w)) {
-                    p1Render.push(`<span class="px-3 py-1.5 bg-slate-800 text-slate-500 line-through rounded-lg text-sm font-semibold border border-slate-700">${w}</span>`);
+                    p1Render.push(`<span onmouseenter="highlightWordPath('${w}')" onmouseleave="clearWordPath()" class="word-trace-item px-3 py-1.5 bg-slate-800 text-slate-500 line-through rounded-lg text-sm font-semibold border border-slate-700">${w}</span>`);
                 } else {
                     const pts = getWordScore(w);
                     p1Score += pts;
-                    p1Render.push(`<span class="px-3 py-1.5 bg-emerald-900/30 text-emerald-400 border border-emerald-800 rounded-lg text-sm font-bold">${w} <span class="text-emerald-300 bg-emerald-900/50 px-1.5 rounded text-xs ml-1">+${pts}</span></span>`);
+                    p1Render.push(`<span onmouseenter="highlightWordPath('${w}')" onmouseleave="clearWordPath()" class="word-trace-item px-3 py-1.5 bg-emerald-900/30 text-emerald-400 border border-emerald-800 rounded-lg text-sm font-bold">${w} <span class="text-emerald-300 bg-emerald-900/50 px-1.5 rounded text-xs ml-1">+${pts}</span></span>`);
                 }
             });
             
@@ -678,11 +808,11 @@
             if (!isSolo) {
                 p2Words.forEach(w => {
                     if (p1Set.has(w)) {
-                        p2Render.push(`<span class="px-3 py-1.5 bg-slate-800 text-slate-500 line-through rounded-lg text-sm font-semibold border border-slate-700">${w}</span>`);
+                        p2Render.push(`<span onmouseenter="highlightWordPath('${w}')" onmouseleave="clearWordPath()" class="word-trace-item px-3 py-1.5 bg-slate-800 text-slate-500 line-through rounded-lg text-sm font-semibold border border-slate-700">${w}</span>`);
                     } else {
                         const pts = getWordScore(w);
                         p2Score += pts;
-                        p2Render.push(`<span class="px-3 py-1.5 bg-blue-900/30 text-blue-400 border border-blue-800 rounded-lg text-sm font-bold">${w} <span class="text-blue-300 bg-blue-900/50 px-1.5 rounded text-xs ml-1">+${pts}</span></span>`);
+                        p2Render.push(`<span onmouseenter="highlightWordPath('${w}')" onmouseleave="clearWordPath()" class="word-trace-item px-3 py-1.5 bg-blue-900/30 text-blue-400 border border-blue-800 rounded-lg text-sm font-bold">${w} <span class="text-blue-300 bg-blue-900/50 px-1.5 rounded text-xs ml-1">+${pts}</span></span>`);
                     }
                 });
             }
@@ -703,7 +833,7 @@
                     <div class="mb-4">
                         <h4 class="text-xs font-bold text-slate-500 uppercase tracking-widest mb-2 border-b border-slate-700/50 pb-1">${lengthStr} (${arr.length})</h4>
                         <div class="flex flex-wrap gap-1.5">
-                            ${arr.map(w => `<span class="px-2.5 py-1 bg-slate-800/80 text-slate-400 border border-slate-700 rounded text-xs font-medium">${w}</span>`).join('')}
+                            ${arr.map(w => `<span onmouseenter="highlightWordPath('${w}')" onmouseleave="clearWordPath()" class="word-trace-item px-2.5 py-1 bg-slate-800/80 hover:bg-violet-950/80 text-slate-400 hover:text-white border border-slate-700 hover:border-violet-500 rounded text-xs font-medium">${w}</span>`).join('')}
                         </div>
                     </div>
                 `;
@@ -726,15 +856,15 @@
             }
 
             return `
-                <div class="glass-panel w-full ${isSolo ? 'max-w-3xl' : 'max-w-6xl'} p-8 sm:p-10 rounded-[2rem] pop-in">
-                    <div class="text-center mb-10">
+                <div class="glass-panel w-full ${isSolo ? 'max-w-4xl' : 'max-w-6xl'} p-8 sm:p-10 rounded-[2rem] pop-in">
+                    <div class="text-center mb-8">
                         <h1 class="text-4xl sm:text-5xl font-black ${winnerColor} tracking-tight mb-2">${winnerText}</h1>
-                        <p class="text-slate-400 font-bold uppercase tracking-widest text-sm">Final Analysis</p>
+                        <p class="text-slate-400 font-bold uppercase tracking-widest text-sm">Final Analysis • Hover words to trace on board</p>
                     </div>
                     
-                    <div class="grid grid-cols-1 ${!isSolo ? 'md:grid-cols-2' : ''} gap-6 mb-8">
+                    <div class="grid grid-cols-1 ${!isSolo ? 'lg:grid-cols-3' : 'md:grid-cols-2'} gap-6 mb-8 items-start">
                         <!-- You -->
-                        <div class="bg-slate-900/60 rounded-2xl p-6 border-t-4 border-emerald-500 flex flex-col h-72">
+                        <div class="bg-slate-900/60 rounded-2xl p-6 border-t-4 border-emerald-500 flex flex-col h-80">
                             <div class="flex justify-between items-end mb-4 pb-4 border-b border-slate-700">
                                 <h2 class="text-2xl font-black text-white">You</h2>
                                 <div class="text-4xl font-black text-emerald-400 tracking-tighter">${p1Score}<span class="text-lg font-bold text-slate-500 ml-1">pts</span></div>
@@ -743,10 +873,28 @@
                                 ${p1Render.length ? p1Render.join('') : '<span class="text-slate-500 font-medium italic w-full text-center mt-10">No words found.</span>'}
                             </div>
                         </div>
+
+                        <!-- Center: Visual Board with SVG Path Tracer -->
+                        <div class="bg-slate-900/60 rounded-2xl p-6 border border-slate-700 flex flex-col items-center justify-center order-first lg:order-none">
+                            <div class="text-xs font-bold text-violet-400 uppercase tracking-widest mb-3 flex items-center gap-1.5">
+                                <svg class="w-4 h-4 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                                <span>Board Trace</span>
+                            </div>
+                            <div id="results-board-container" class="relative bg-slate-950 p-3 sm:p-4 rounded-2xl border border-slate-800 shadow-2xl select-none">
+                                <div id="results-board-grid" class="grid grid-cols-4 gap-2 sm:gap-2.5">
+                                    ${state.board.map((letter, idx) => {
+                                        const display = letter === 'Q' ? 'Qu' : letter;
+                                        return `<div id="res-die-${idx}" class="res-die aspect-square w-11 h-11 sm:w-12 sm:h-12 rounded-xl flex items-center justify-center text-xl sm:text-2xl font-black text-white bg-slate-800/90 border border-slate-700 transition-all duration-150 uppercase">${display}</div>`;
+                                    }).join('')}
+                                </div>
+                                <svg id="results-path-svg" class="absolute inset-0 pointer-events-none w-full h-full z-20"></svg>
+                            </div>
+                            <p id="results-hover-hint" class="text-xs text-slate-400 mt-3 font-medium text-center">Hover any word to trace</p>
+                        </div>
                         
                         <!-- Opponent -->
                         ${!isSolo ? `
-                            <div class="bg-slate-900/60 rounded-2xl p-6 border-t-4 border-blue-500 flex flex-col h-72">
+                            <div class="bg-slate-900/60 rounded-2xl p-6 border-t-4 border-blue-500 flex flex-col h-80">
                                 <div class="flex justify-between items-end mb-4 pb-4 border-b border-slate-700">
                                     <h2 class="text-2xl font-black text-white">Opponent</h2>
                                     <div class="text-4xl font-black text-blue-400 tracking-tighter">${p2Score}<span class="text-lg font-bold text-slate-500 ml-1">pts</span></div>
@@ -788,15 +936,65 @@
                             </div>
                         `}
                         <button type="button" id="btn-home" class="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600 font-bold text-lg py-4 px-8 rounded-xl transition-all">
-                            Quit
+                            Back to Home
                         </button>
                     </div>
                 </div>
             `;
         }
 
+        // SVG Trace Function
+        function highlightWordPath(word) {
+            const path = state.wordPaths && state.wordPaths.get(word.toUpperCase());
+            const svg = document.getElementById('results-path-svg');
+            const hint = document.getElementById('results-hover-hint');
+            if (!svg) return;
+            
+            clearWordPath();
+            
+            if (hint) hint.innerHTML = `<span class="text-violet-300 font-bold tracking-wider">${word.toUpperCase()}</span>`;
+            if (!path || path.length === 0) return;
+
+            const boardContainer = document.getElementById('results-board-container');
+            const containerRect = boardContainer.getBoundingClientRect();
+
+            const points = [];
+            path.forEach((dieIdx) => {
+                const dieEl = document.getElementById(`res-die-${dieIdx}`);
+                if (dieEl) {
+                    dieEl.classList.add('bg-violet-600', 'border-fuchsia-400', 'shadow-[0_0_15px_rgba(168,85,247,0.7)]', 'scale-105', 'z-10');
+                    const dieRect = dieEl.getBoundingClientRect();
+                    const x = dieRect.left - containerRect.left + dieRect.width / 2;
+                    const y = dieRect.top - containerRect.top + dieRect.height / 2;
+                    points.push(`${x},${y}`);
+                }
+            });
+
+            if (points.length > 1) {
+                const polyline = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+                polyline.setAttribute('points', points.join(' '));
+                polyline.setAttribute('fill', 'none');
+                polyline.setAttribute('stroke', '#ec4899');
+                polyline.setAttribute('stroke-width', '4');
+                polyline.setAttribute('stroke-linecap', 'round');
+                polyline.setAttribute('stroke-linejoin', 'round');
+                polyline.style.filter = 'drop-shadow(0 0 8px rgba(236, 72, 153, 0.9))';
+                svg.appendChild(polyline);
+            }
+        }
+
+        function clearWordPath() {
+            const svg = document.getElementById('results-path-svg');
+            const hint = document.getElementById('results-hover-hint');
+            if (svg) svg.innerHTML = '';
+            if (hint) hint.textContent = 'Hover any word to trace';
+            document.querySelectorAll('.res-die').forEach(el => {
+                el.classList.remove('bg-violet-600', 'border-fuchsia-400', 'shadow-[0_0_15px_rgba(168,85,247,0.7)]', 'scale-105', 'z-10');
+            });
+        }
+
         // ==========================================
-        // 6. EVENT LISTENERS & GAME FLOW
+        // 7. EVENT LISTENERS & GAME FLOW
         // ==========================================
         function attachEventListeners() {
             if (state.view === 'home') {
@@ -814,36 +1012,71 @@
                     initHost();
                 });
                 
-                document.getElementById('btn-join').addEventListener('click', () => {
+                const joinAction = () => {
                     state.mode = 'multi';
                     const code = document.getElementById('input-room-code').value.trim().toUpperCase();
                     if (code.length !== 4) return showToast("Enter a 4-letter code", true);
                     const btn = document.getElementById('btn-join');
                     btn.innerHTML = `<svg class="animate-spin h-5 w-5 mx-auto" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>`;
                     initGuest(code);
+                };
+
+                document.getElementById('btn-join').addEventListener('click', joinAction);
+                
+                const codeInput = document.getElementById('input-room-code');
+                codeInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        joinAction();
+                    }
                 });
             }
             
-            if (state.view === 'lobby' && state.role === 'host') {
+            if (state.view === 'lobby') {
                 const btnStart = document.getElementById('btn-start');
                 if (btnStart) {
                     btnStart.addEventListener('click', () => triggerGameStart('start'));
+                }
+                const btnLobbyBack = document.getElementById('btn-lobby-back');
+                if (btnLobbyBack) {
+                    btnLobbyBack.addEventListener('click', () => resetState());
                 }
             }
             
             if (state.view === 'game') {
                 const input = document.getElementById('ui-word-input');
+                const btnSubmit = document.getElementById('btn-submit-word');
                 const btnFinish = document.getElementById('btn-finish-early');
                 const btnRescramble = document.getElementById('btn-rescramble');
 
-                input.addEventListener('keypress', (e) => {
+                // Submit button click
+                if (btnSubmit) {
+                    btnSubmit.addEventListener('click', submitCurrentWord);
+                }
+
+                // Keyboard handling for typing box
+                input.addEventListener('keydown', (e) => {
+                    // Backspace pops last clicked die and updates highlights
+                    if (e.key === 'Backspace' && state.selectedDice.length > 0) {
+                        if (input.selectionStart === input.value.length && input.selectionEnd === input.value.length) {
+                            e.preventDefault();
+                            state.selectedDice.pop();
+                            updateInputFromSelectedDice();
+                            updateBoardDiceHighlights();
+                            return;
+                        }
+                    }
                     if (e.key === 'Enter') {
                         e.preventDefault(); 
-                        const word = input.value.trim().toUpperCase();
-                        if (word) {
-                            input.value = '';
-                            processWord(word);
-                        }
+                        submitCurrentWord();
+                    }
+                });
+
+                // Clear highlights if manually modifying text
+                input.addEventListener('input', () => {
+                    const currentWord = state.selectedDice.map(i => state.board[i] === 'Q' ? 'QU' : state.board[i]).join('');
+                    if (input.value.toUpperCase() !== currentWord) {
+                        clearSelectedDice();
                     }
                 });
                 
@@ -881,6 +1114,7 @@
                         if (state.mode === 'multi') sendMQTT(state.guestTopic, 'restart');
                         state.myWords = [];
                         state.oppWords = null;
+                        state.selectedDice = [];
                         state.view = 'lobby';
                         renderView();
                     });
@@ -915,6 +1149,7 @@
             state.myFinishEarly = false;
             state.oppFinishEarly = false;
             state.isFinished = false;
+            state.selectedDice = [];
             if (state.wordsInterval) {
                 clearInterval(state.wordsInterval);
                 state.wordsInterval = null;
@@ -925,13 +1160,11 @@
         }
 
         function processWord(word) {
-            const input = document.getElementById('ui-word-input');
             const minLen = state.allow3Letter ? 3 : 4;
             
             if (word.length < minLen) return flashInputError(`Too short! (Min ${minLen} letters)`);
             if (state.myWords.includes(word)) return flashInputError("Already found!");
             
-            // Intelligent Validation requested in prompt
             if (state.currentBoardValidWords.includes(word)) {
                 state.myWords.push(word);
                 updateWordListUI();
@@ -945,10 +1178,12 @@
         function flashInputError(msg) {
             const input = document.getElementById('ui-word-input');
             showToast(msg, true);
-            input.classList.add('shake', 'border-red-500', 'bg-red-900/50');
-            setTimeout(() => {
-                input.classList.remove('shake', 'border-red-500', 'bg-red-900/50');
-            }, 500);
+            if (input) {
+                input.classList.add('shake', 'border-red-500', 'bg-red-900/50');
+                setTimeout(() => {
+                    input.classList.remove('shake', 'border-red-500', 'bg-red-900/50');
+                }, 500);
+            }
         }
 
         function updateWordListUI() {
@@ -985,8 +1220,10 @@
             const overlay = document.getElementById('ui-end-overlay');
             const btnFinish = document.getElementById('btn-finish-early');
             const btnRescramble = document.getElementById('btn-rescramble');
+            const btnSubmit = document.getElementById('btn-submit-word');
             
             if (input) input.disabled = true;
+            if (btnSubmit) btnSubmit.disabled = true;
             if (btnFinish) btnFinish.disabled = true;
             if (btnRescramble) btnRescramble.disabled = true;
             
@@ -1002,7 +1239,6 @@
                 
                 if (state.wordsInterval) clearInterval(state.wordsInterval);
                 
-                // Persistent knock for end-game words exchange
                 state.wordsInterval = setInterval(() => {
                     sendMQTT(targetTopic, 'words', { words: state.myWords });
                     if (state.oppWords !== null) {
@@ -1011,7 +1247,6 @@
                     }
                 }, 1000);
                 
-                // Initial send
                 sendMQTT(targetTopic, 'words', { words: state.myWords });
             }
             
