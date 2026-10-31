@@ -112,7 +112,7 @@
         async function loadDictionary() {
             try {
                 // Fetching a comprehensive dictionary
-                const res = await fetch('https://github.com/pjackowski/passphrase-gen/blob/master/corncob-lowercase.txt);
+                const res = await fetch('./corncob.txt);
                 const text = await res.text();
                 const words = text.split(/\r?\n/);
                 
