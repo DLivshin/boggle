@@ -97,6 +97,18 @@
             dictCache: {}
         };
 
+        const peerConfig = {
+            host: '0.peerjs.com',
+            port: 443,
+            secure: true,
+            config: {
+                'iceServers': [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' }
+                ]
+            }
+        };
+
         const DOM = document.getElementById('app');
 
         // ==========================================
@@ -204,9 +216,11 @@
             const code = generateRoomCode();
             state.roomCode = code;
             state.role = 'host';
-            state.peer = new Peer(`BGL-${code}`); // Prefix to avoid global collisions
+            showToast("Connecting to signaling server...");
+            state.peer = new Peer(`BGL-${code}`, peerConfig); // Use explicit config
 
             state.peer.on('open', (id) => {
+                showToast("Host ready! Waiting for guest...");
                 state.view = 'lobby';
                 renderView();
             });
@@ -224,23 +238,28 @@
             });
 
             state.peer.on('error', (err) => {
-                showToast("Connection Error. Try another code.", true);
+                let msg = err.message || "Connection Error";
+                showToast(`Error: ${msg}`, true);
                 resetState();
             });
         }
 
         function initGuest(code) {
-            state.roomCode = code.toUpperCase();
+            state.roomCode = code;
             state.role = 'guest';
-            state.peer = new Peer(); // Guest doesn't need a specific ID
+            showToast("Connecting to signaling server...");
+            state.peer = new Peer(peerConfig); // Use explicit config
 
             state.peer.on('open', (id) => {
+                showToast("Connecting to host...");
                 state.conn = state.peer.connect(`BGL-${state.roomCode}`, { reliable: true });
                 setupConnectionHandlers();
             });
 
             state.peer.on('error', (err) => {
-                showToast("Failed to connect to room.", true);
+                let msg = err.message || "Failed to connect";
+                if (err.type === 'peer-unavailable') msg = "Room not found!";
+                showToast(`Error: ${msg}`, true);
                 resetState();
             });
         }
@@ -569,10 +588,10 @@
                     initHost();
                 });
                 document.getElementById('btn-join').addEventListener('click', () => {
-                    const code = document.getElementById('input-room-code').value.trim();
+                    const code = document.getElementById('input-room-code').value.trim().toUpperCase();
                     if (code.length !== 4) return showToast("Enter a 4-letter code", true);
                     const btn = document.getElementById('btn-join');
-                    btn.innerText = '...';
+                    btn.innerHTML = `<svg class="animate-spin h-5 w-5 mx-auto" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>`;
                     initGuest(code);
                 });
             }
