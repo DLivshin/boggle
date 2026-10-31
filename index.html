@@ -8,8 +8,8 @@
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     
-    <!-- PeerJS for P2P Multiplayer -->
-    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <!-- MQTT for PubSub Multiplayer -->
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;900&display=swap');
@@ -149,8 +149,6 @@
             view: 'home', 
             mode: null,   
             role: null,   
-            peer: null,
-            conn: null,
             roomCode: null,
             board: [],
             duration: 120,
@@ -159,10 +157,15 @@
             oppWords: null, 
             myFinishEarly: false,
             oppFinishEarly: false,
-            currentBoardValidWords: [] // Pre-solved words for the current board
+            currentBoardValidWords: [], // Pre-solved words for the current board
+            
+            // MQTT Networking State
+            mqttClient: null,
+            clientId: 'client-' + Math.random().toString(36).substring(2, 10),
+            topic: null,
+            guestConnected: false
         };
 
-        const peerConfig = { config: { 'iceServers': [{ urls: 'stun:stun.l.google.com:19302' }] } };
         const DOM = document.getElementById('app');
 
         // ==========================================
@@ -254,80 +257,93 @@
         }
 
         // ==========================================
-        // 4. PEERJS NETWORKING
+        // 4. MQTT NETWORKING
         // ==========================================
         function initHost() {
             const code = generateRoomCode();
             state.roomCode = code;
             state.role = 'host';
-            showToast("Connecting to signaling server...");
-            state.peer = new Peer(`BGL-${code}`, peerConfig);
-
-            state.peer.on('open', (id) => {
-                showToast("Host ready! Waiting for guest...");
-                state.view = 'lobby';
-                renderView();
-            });
-
-            state.peer.on('connection', (connection) => {
-                if (state.conn) {
-                    connection.on('open', () => connection.send({ type: 'error', msg: 'Room is full' }));
-                    return;
-                }
-                state.conn = connection;
-                setupConnectionHandlers();
-                state.view = 'lobby'; 
-                renderView();
-            });
-
-            state.peer.on('error', (err) => {
-                showToast(`Error: ${err.message}`, true);
-                resetState();
-            });
+            state.guestConnected = false;
+            showToast("Connecting to MQTT broker...");
+            setupMQTT();
         }
 
         function initGuest(code) {
             state.roomCode = code;
             state.role = 'guest';
-            showToast("Connecting to signaling server...");
-            state.peer = new Peer(peerConfig);
-
-            state.peer.on('open', (id) => {
-                showToast("Connecting to host...");
-                state.conn = state.peer.connect(`BGL-${state.roomCode}`, { reliable: true });
-                setupConnectionHandlers();
-            });
-
-            state.peer.on('error', (err) => {
-                showToast(`Error: ${err.type === 'peer-unavailable' ? 'Room not found' : err.message}`, true);
-                resetState();
-            });
+            showToast("Connecting to MQTT broker...");
+            setupMQTT();
         }
 
-        function setupConnectionHandlers() {
-            state.conn.on('open', () => {
-                if (state.role === 'guest') {
-                    state.view = 'lobby';
-                    renderView();
-                    showToast("Connected to host!");
-                }
+        function setupMQTT() {
+            state.topic = 'boggle-v1-room-' + state.roomCode.toUpperCase();
+            // Connect to free public EMQX broker securely
+            state.mqttClient = mqtt.connect('wss://broker.emqx.io:8084/mqtt');
+
+            state.mqttClient.on('connect', () => {
+                state.mqttClient.subscribe(state.topic, (err) => {
+                    if (!err) {
+                        if (state.role === 'host') {
+                            showToast("Host ready! Waiting for guest...");
+                            state.view = 'lobby';
+                            renderView();
+                        } else if (state.role === 'guest') {
+                            showToast("Connected to broker, joining room...");
+                            sendNetworkMessage('guest_joined', {});
+                        }
+                    } else {
+                        showToast("Failed to subscribe to room", true);
+                        resetState();
+                    }
+                });
             });
 
-            state.conn.on('data', (data) => handleNetworkMessage(data));
+            state.mqttClient.on('message', (topic, message) => {
+                try {
+                    const data = JSON.parse(message.toString());
+                    if (data.senderId === state.clientId) return; // Ignore own echoes
+                    handleNetworkMessage(data);
+                } catch(e) {
+                    console.error("Failed to parse MQTT message", e);
+                }
+            });
             
-            state.conn.on('close', () => {
-                showToast("Opponent disconnected.", true);
+            state.mqttClient.on('error', (err) => {
+                showToast(`MQTT Error: ${err.message}`, true);
                 resetState();
             });
         }
 
         function handleNetworkMessage(data) {
             switch (data.type) {
+                case 'guest_joined':
+                    if (state.role === 'host') {
+                        state.guestConnected = true;
+                        showToast("Opponent Joined!");
+                        renderView();
+                        sendNetworkMessage('host_state', { view: state.view, duration: state.duration, board: state.board });
+                    }
+                    break;
+                case 'host_state':
+                    if (state.role === 'guest') {
+                        state.duration = data.payload.duration;
+                        if (state.view !== data.payload.view) {
+                            state.view = data.payload.view;
+                            if (state.view === 'game') {
+                                state.board = data.payload.board;
+                                state.currentBoardValidWords = solveBoard(state.board);
+                                startGameTimer();
+                            }
+                        }
+                        showToast("Connected to host!");
+                        renderView();
+                    }
+                    break;
                 case 'start':
-                case 'rescramble': // Treat rescramble exactly like a fresh start in the game view
-                    state.board = data.board;
-                    state.duration = data.duration;
-                    state.currentBoardValidWords = solveBoard(state.board); // Both compute to verify
+                case 'rescramble': 
+                    state.board = data.payload.board;
+                    state.duration = data.payload.duration;
+                    state.currentBoardValidWords = solveBoard(state.board); 
                     state.myWords = [];
                     state.oppWords = null;
                     state.myFinishEarly = false;
@@ -338,7 +354,7 @@
                     if(data.type === 'rescramble') showToast("Host rescrambled the board!");
                     break;
                 case 'words':
-                    state.oppWords = data.words;
+                    state.oppWords = data.payload.words;
                     checkResultsReady();
                     break;
                 case 'finish_early':
@@ -353,28 +369,32 @@
                     renderView();
                     showToast("Host returned to lobby.");
                     break;
-                case 'error':
-                    showToast(data.msg, true);
-                    resetState();
-                    break;
             }
         }
 
-        function sendNetworkMessage(payload) {
-            if (state.mode === 'multi' && state.conn && state.conn.open) {
-                state.conn.send(payload);
+        function sendNetworkMessage(type, payload = {}) {
+            if (state.mode === 'multi' && state.mqttClient && state.mqttClient.connected) {
+                const msg = JSON.stringify({
+                    senderId: state.clientId,
+                    type: type,
+                    payload: payload
+                });
+                state.mqttClient.publish(state.topic, msg);
             }
         }
 
         function resetState() {
             if (state.timerInterval) clearInterval(state.timerInterval);
-            if (state.peer) state.peer.destroy();
-            state.peer = null;
-            state.conn = null;
+            if (state.mqttClient) {
+                state.mqttClient.end();
+                state.mqttClient = null;
+            }
             state.view = 'home';
             state.role = null;
             state.mode = null;
             state.roomCode = null;
+            state.topic = null;
+            state.guestConnected = false;
             renderView();
         }
 
@@ -446,7 +466,7 @@
 
         function getLobbyHTML() {
             const isHost = state.role === 'host';
-            const hasGuest = !!state.conn && state.conn.open;
+            const hasGuest = state.role === 'guest' || state.guestConnected;
             const isSolo = state.mode === 'single';
             
             return `
@@ -753,7 +773,7 @@
 
                         if (state.mode === 'single') forceEndGame();
                         else {
-                            sendNetworkMessage({ type: 'finish_early' });
+                            sendNetworkMessage('finish_early');
                             if (state.myFinishEarly && state.oppFinishEarly) forceEndGame();
                         }
                     });
@@ -767,7 +787,7 @@
                 
                 if (btnRestart && state.role === 'host') {
                     btnRestart.addEventListener('click', () => {
-                        if (state.mode === 'multi') sendNetworkMessage({ type: 'restart' });
+                        if (state.mode === 'multi') sendNetworkMessage('restart');
                         state.myWords = [];
                         state.oppWords = null;
                         state.view = 'lobby';
@@ -790,8 +810,7 @@
             state.currentBoardValidWords = solveBoard(state.board); // PRE-SOLVE THE BOARD!
             
             if (state.mode === 'multi') {
-                sendNetworkMessage({
-                    type: networkType,
+                sendNetworkMessage(networkType, {
                     board: state.board,
                     duration: state.duration
                 });
@@ -880,7 +899,7 @@
             }
             
             if (state.mode === 'multi') {
-                sendNetworkMessage({ type: 'words', words: state.myWords });
+                sendNetworkMessage('words', { words: state.myWords });
             }
             
             checkResultsReady();
