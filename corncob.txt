@@ -22420,6 +22420,7 @@ gravitons
 gravity
 gravures
 gravy
+gray
 graze
 grazed
 grazer
@@ -52047,6 +52048,7 @@ tincture
 tinctured
 tinder
 tinderbox
+tine
 tinfoil
 tinge
 tinged
