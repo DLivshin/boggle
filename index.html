@@ -173,33 +173,72 @@
             "EIOSST", "ELRTTY", "HIMNQU", "HLNNRZ"
         ];
 
+        const MAX_PLAYERS = 4;
+
+        // Colors by display position: you first (emerald), then the other players
+        const PLAYER_COLORS = [
+            { border: 'border-emerald-500', text: 'text-emerald-400', chip: 'bg-emerald-900/30 text-emerald-400 border border-emerald-800', pts: 'text-emerald-300 bg-emerald-900/50' },
+            { border: 'border-blue-500', text: 'text-blue-400', chip: 'bg-blue-900/30 text-blue-400 border border-blue-800', pts: 'text-blue-300 bg-blue-900/50' },
+            { border: 'border-amber-500', text: 'text-amber-400', chip: 'bg-amber-900/30 text-amber-400 border border-amber-800', pts: 'text-amber-300 bg-amber-900/50' },
+            { border: 'border-fuchsia-500', text: 'text-fuchsia-400', chip: 'bg-fuchsia-900/30 text-fuchsia-400 border border-fuchsia-800', pts: 'text-fuchsia-300 bg-fuchsia-900/50' }
+        ];
+
         const state = {
-            view: 'home', 
-            mode: null,   
-            role: null,   
+            view: 'home',
+            mode: null,
+            role: null,
             roomCode: null,
             board: [],
             duration: 180,
             allow3Letter: true,
+            showHidden: true,
+            rotation: 0,
+            round: 0,
             timerInterval: null,
             myWords: [],
-            oppWords: null, 
+            players: [],          // [{ id, slot, wins }] - slot 0 is the host
+            allWords: null,       // { playerId: [words] } once a round is over
+            oppFound: {},         // { playerId: [word lengths] } - shown hidden as XXXX
+            finishedIds: [],
+            submitted: {},        // host only: words received from each player
+            resultsPayload: null, // host only: cached results broadcast
             myFinishEarly: false,
-            oppFinishEarly: false,
             isFinished: false,
-            currentBoardValidWords: [], 
+            currentBoardValidWords: [],
             wordPaths: new Map(),
             selectedDice: [],
-            
+
             // MQTT State
             mqttClient: null,
             clientId: 'boggle-' + Math.random().toString(36).substring(2, 10),
             hostTopic: null,
             guestTopic: null,
-            guestConnected: false,
             joinInterval: null,
-            wordsInterval: null
+            wordsInterval: null,
+            resultsTimeout: null
         };
+
+        // --- Player helpers ---
+        function getPlayer(id) {
+            return state.players.find(p => p.id === id);
+        }
+
+        // You first, then everyone else in slot order
+        function orderedPlayers() {
+            const me = state.players.filter(p => p.id === state.clientId);
+            const others = state.players.filter(p => p.id !== state.clientId).sort((a, b) => a.slot - b.slot);
+            return [...me, ...others];
+        }
+
+        function playerLabel(p) {
+            if (p.id === state.clientId) return 'You';
+            return state.players.length === 2 ? 'Opponent' : `Player ${p.slot + 1}`;
+        }
+
+        function playerColor(p) {
+            const i = orderedPlayers().findIndex(x => x.id === p.id);
+            return PLAYER_COLORS[Math.max(0, i) % PLAYER_COLORS.length];
+        }
 
         const DOM = document.getElementById('app');
 
@@ -302,7 +341,8 @@
         function initHost() {
             state.roomCode = generateRoomCode();
             state.role = 'host';
-            state.guestConnected = false;
+            state.players = [{ id: state.clientId, slot: 0, wins: 0 }];
+            state.round = 0;
             showToast("Connecting to network...");
             setupMQTT();
         }
@@ -310,6 +350,8 @@
         function initGuest(code) {
             state.roomCode = code;
             state.role = 'guest';
+            state.players = [];
+            state.round = 0;
             showToast("Connecting to network...");
             setupMQTT();
         }
@@ -317,19 +359,30 @@
         function setupMQTT() {
             state.hostTopic = `boggle_${state.roomCode}_host`;
             state.guestTopic = `boggle_${state.roomCode}_guest`;
-            
+
+            // If we drop off unexpectedly, the broker tells the room on our behalf
+            const isHostRole = state.role === 'host';
+            const will = {
+                topic: isHostRole ? state.guestTopic : state.hostTopic,
+                payload: JSON.stringify({ senderId: state.clientId, type: isHostRole ? 'host_left' : 'leave', payload: {} }),
+                qos: 1
+            };
+
             state.mqttClient = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', {
                 clientId: state.clientId,
-                clean: true
+                clean: true,
+                will: will
             });
 
             state.mqttClient.on('connect', () => {
                 if (state.role === 'host') {
                     state.mqttClient.subscribe(state.hostTopic, { qos: 1 }, (err) => {
                         if (!err) {
-                            showToast("Room created! Waiting for guest...");
-                            state.view = 'lobby';
-                            renderView();
+                            if (state.view === 'home') {
+                                showToast("Room created! Waiting for players...");
+                                state.view = 'lobby';
+                                renderView();
+                            }
                         } else {
                             handleConnectionError();
                         }
@@ -338,6 +391,7 @@
                     state.mqttClient.subscribe(state.guestTopic, { qos: 1 }, (err) => {
                         if (!err) {
                             showToast("Looking for host...");
+                            if (state.joinInterval) clearInterval(state.joinInterval);
                             state.joinInterval = setInterval(() => {
                                 sendMQTT(state.hostTopic, 'join');
                             }, 1500);
@@ -352,13 +406,13 @@
             state.mqttClient.on('message', (topic, message) => {
                 try {
                     const data = JSON.parse(message.toString());
-                    if (data.senderId === state.clientId) return; 
+                    if (data.senderId === state.clientId) return;
                     handleNetworkMessage(topic, data);
                 } catch(e) {
                     console.error("MQTT parse error", e);
                 }
             });
-            
+
             state.mqttClient.on('error', (err) => handleConnectionError(err.message));
         }
 
@@ -373,93 +427,208 @@
             }
         }
 
+        // Host -> every guest
+        function broadcast(type, payload = {}) {
+            sendMQTT(state.guestTopic, type, payload);
+        }
+
+        // Guest -> host
+        function sendToHost(type, payload = {}) {
+            sendMQTT(state.hostTopic, type, payload);
+        }
+
+        function broadcastLobbyState() {
+            broadcast('lobby_state', {
+                players: state.players,
+                duration: state.duration,
+                allow3Letter: state.allow3Letter,
+                showHidden: state.showHidden
+            });
+        }
+
         function handleNetworkMessage(topic, data) {
-            if (state.role === 'host' && topic === state.hostTopic) {
-                if (data.type === 'join') {
-                    if (!state.guestConnected) {
-                        state.guestConnected = true;
-                        showToast("Opponent Joined!");
+            if (state.role === 'host' && topic === state.hostTopic) handleHostMessage(data);
+            else if (state.role === 'guest' && topic === state.guestTopic) handleGuestMessage(data);
+        }
+
+        function handleHostMessage(data) {
+            const id = data.senderId;
+            const p = data.payload || {};
+
+            switch (data.type) {
+                case 'join': {
+                    let player = getPlayer(id);
+                    if (!player) {
+                        if (state.view !== 'lobby') {
+                            return broadcast('rejected', { to: id, reason: 'Game already in progress' });
+                        }
+                        if (state.players.length >= MAX_PLAYERS) {
+                            return broadcast('rejected', { to: id, reason: 'Room is full' });
+                        }
+                        const used = state.players.map(x => x.slot);
+                        let slot = 1;
+                        while (used.includes(slot)) slot++;
+                        player = { id: id, slot: slot, wins: 0 };
+                        state.players.push(player);
+                        state.players.sort((a, b) => a.slot - b.slot);
+                        showToast(`Player ${slot + 1} Joined!`);
                         renderView();
                     }
-                    sendMQTT(state.guestTopic, 'lobby_state', { 
-                        view: state.view, 
-                        duration: state.duration, 
-                        allow3Letter: state.allow3Letter,
-                        board: state.board 
-                    });
+                    broadcastLobbyState();
+                    break;
                 }
-                if (data.type === 'words') {
-                    state.oppWords = data.payload.words;
-                    checkResultsReady();
-                }
-                if (data.type === 'finish_early') {
-                    handleOpponentFinishEarly();
-                }
+                case 'leave':
+                    removePlayer(id);
+                    break;
+                case 'found':
+                    if (p.round === state.round && getPlayer(id)) {
+                        recordOppFound(id, p.len);
+                        broadcast('opp_found', { id: id, len: p.len, round: state.round });
+                    }
+                    break;
+                case 'finish_early':
+                    if (state.view === 'game' && getPlayer(id) && !state.finishedIds.includes(id)) {
+                        markFinished(id);
+                    }
+                    break;
+                case 'words':
+                    if (p.round !== state.round || !getPlayer(id)) break;
+                    state.submitted[id] = p.words || [];
+                    if (state.resultsPayload) {
+                        // They missed the results broadcast - send it again
+                        broadcast('results', state.resultsPayload);
+                    } else {
+                        checkResultsReady();
+                    }
+                    break;
             }
+        }
 
-            if (state.role === 'guest' && topic === state.guestTopic) {
-                if (data.type === 'lobby_state') {
+        function handleGuestMessage(data) {
+            const p = data.payload || {};
+
+            switch (data.type) {
+                case 'rejected':
+                    if (p.to === state.clientId) handleConnectionError(p.reason || 'Could not join room');
+                    return;
+                case 'host_left':
+                    showToast('Host left the room', true);
+                    resetState();
+                    return;
+                case 'lobby_state':
+                    if (!p.players || !p.players.some(pl => pl.id === state.clientId)) return;
+                    state.players = p.players;
+                    state.duration = p.duration;
+                    state.allow3Letter = p.allow3Letter;
+                    state.showHidden = p.showHidden;
                     if (state.joinInterval) {
                         clearInterval(state.joinInterval);
                         state.joinInterval = null;
                         showToast("Connected to host!");
                     }
-                    
-                    state.duration = data.payload.duration;
-                    state.allow3Letter = data.payload.allow3Letter;
-                    if (state.view !== data.payload.view) {
-                        state.view = data.payload.view;
-                        if (state.view === 'game') {
-                            state.board = data.payload.board;
-                            state.currentBoardValidWords = solveBoard(state.board);
-                            startGameTimer();
-                        }
-                    }
-                    renderView();
-                }
-                if (data.type === 'start' || data.type === 'rescramble') {
-                    state.board = data.payload.board;
-                    state.duration = data.payload.duration;
-                    state.allow3Letter = data.payload.allow3Letter;
-                    state.currentBoardValidWords = solveBoard(state.board); 
-                    state.myWords = [];
-                    state.oppWords = null;
-                    state.myFinishEarly = false;
-                    state.oppFinishEarly = false;
-                    state.selectedDice = [];
+                    if (state.view === 'home') state.view = 'lobby';
+                    if (state.view === 'lobby') renderView();
+                    else { updateFinishButton(); updateHiddenPanel(); }
+                    return;
+            }
+
+            if (!getPlayer(state.clientId)) return;
+
+            switch (data.type) {
+                case 'start':
+                case 'rescramble':
+                    state.board = p.board;
+                    state.duration = p.duration;
+                    state.allow3Letter = p.allow3Letter;
+                    state.showHidden = p.showHidden;
+                    state.round = p.round;
+                    state.currentBoardValidWords = solveBoard(state.board);
+                    resetRoundState();
                     state.view = 'game';
                     renderView();
                     startGameTimer();
-                    if(data.type === 'rescramble') showToast("Host rescrambled!");
-                }
-                if (data.type === 'words') {
-                    state.oppWords = data.payload.words;
-                    checkResultsReady();
-                }
-                if (data.type === 'finish_early') {
-                    handleOpponentFinishEarly();
-                }
-                if (data.type === 'restart') {
-                    state.myWords = [];
-                    state.oppWords = null;
-                    state.selectedDice = [];
+                    if (data.type === 'rescramble') showToast("Host rescrambled!");
+                    break;
+                case 'opp_found':
+                    if (p.round === state.round) recordOppFound(p.id, p.len);
+                    break;
+                case 'finish_update':
+                    if (p.round === state.round) onFinishUpdate(p.finished || []);
+                    break;
+                case 'force_end':
+                    if (p.round === state.round && state.view === 'game') forceEndGame();
+                    break;
+                case 'results':
+                    if (p.round !== state.round || state.allWords) break;
+                    state.players = p.players;
+                    showResults(p.words);
+                    break;
+                case 'restart':
+                    state.players = p.players || state.players;
+                    resetRoundState();
                     state.view = 'lobby';
                     renderView();
                     showToast("Host returned to lobby.");
-                }
+                    break;
             }
         }
 
-        function handleOpponentFinishEarly() {
-            state.oppFinishEarly = true;
-            showToast("Opponent finished early!");
-            const btn = document.getElementById('btn-finish-early');
-            if(btn && state.myFinishEarly) {
+        function removePlayer(id) {
+            const leaving = getPlayer(id);
+            if (!leaving) return;
+            const label = `Player ${leaving.slot + 1}`;
+            state.players = state.players.filter(x => x.id !== id);
+            delete state.submitted[id];
+            delete state.oppFound[id];
+            state.finishedIds = state.finishedIds.filter(x => x !== id);
+            showToast(`${label} left`, true);
+            broadcastLobbyState();
+
+            if (state.view === 'lobby') {
+                renderView();
+            } else if (state.view === 'game') {
+                onFinishUpdate(state.finishedIds);
+                updateHiddenPanel();
+                checkResultsReady();
+            }
+        }
+
+        // Host: a player (maybe the host) pressed Finish Early
+        function markFinished(id) {
+            const list = [...state.finishedIds, id];
+            onFinishUpdate(list);
+            broadcast('finish_update', { finished: list, round: state.round });
+        }
+
+        // Everyone: the list of players who finished early changed
+        function onFinishUpdate(list) {
+            const prev = state.finishedIds;
+            state.finishedIds = list.slice();
+            list.filter(id => !prev.includes(id) && id !== state.clientId).forEach(id => {
+                const p = getPlayer(id);
+                if (p) showToast(`${playerLabel(p)} finished early!`);
+            });
+            updateFinishButton();
+
+            if (state.role === 'host' && state.view === 'game' && !state.isFinished &&
+                state.players.length > 0 && state.players.every(p => state.finishedIds.includes(p.id))) {
+                broadcast('force_end', { round: state.round });
                 forceEndGame();
-            } else if (btn) {
+            }
+        }
+
+        function updateFinishButton() {
+            const btn = document.getElementById('btn-finish-early');
+            if (!btn || state.mode !== 'multi') return;
+            const total = state.players.length;
+            const others = state.finishedIds.filter(id => id !== state.clientId && getPlayer(id)).length;
+
+            if (state.myFinishEarly) {
+                btn.textContent = total === 2 ? "Waiting for opponent..." : "Waiting for others...";
+            } else if (others > 0) {
                 btn.classList.remove('bg-rose-900/40');
                 btn.classList.add('bg-rose-600', 'text-white');
-                btn.textContent = "Opponent Finished. Click to End";
+                btn.textContent = total === 2 ? "Opponent Finished. Click to End" : `${others} of ${total - 1} Finished. Click to End`;
             }
         }
 
@@ -473,7 +642,12 @@
             if (state.timerInterval) clearInterval(state.timerInterval);
             if (state.joinInterval) clearInterval(state.joinInterval);
             if (state.wordsInterval) clearInterval(state.wordsInterval);
+            if (state.resultsTimeout) clearTimeout(state.resultsTimeout);
             if (state.mqttClient) {
+                if (state.mqttClient.connected) {
+                    if (state.role === 'host') sendMQTT(state.guestTopic, 'host_left');
+                    else if (state.role === 'guest') sendMQTT(state.hostTopic, 'leave');
+                }
                 state.mqttClient.end();
                 state.mqttClient = null;
             }
@@ -483,13 +657,21 @@
             state.roomCode = null;
             state.hostTopic = null;
             state.guestTopic = null;
-            state.guestConnected = false;
+            state.players = [];
+            state.round = 0;
+            state.allWords = null;
+            state.oppFound = {};
+            state.finishedIds = [];
+            state.submitted = {};
+            state.resultsPayload = null;
             state.isFinished = false;
+            state.myFinishEarly = false;
             state.selectedDice = [];
             renderView();
         }
 
         function forceEndGame() {
+            if (state.isFinished) return;
             if (state.timerInterval) clearInterval(state.timerInterval);
             finishGame();
         }
@@ -507,6 +689,10 @@
             const allow3Input = document.getElementById('input-allow-3');
             if (allow3Input) {
                 state.allow3Letter = allow3Input.checked;
+            }
+            const showHiddenInput = document.getElementById('input-show-hidden');
+            if (showHiddenInput) {
+                state.showHidden = showHiddenInput.checked;
             }
 
             if (state.view === 'home') DOM.innerHTML = getHomeHTML();
@@ -560,9 +746,36 @@
 
         function getLobbyHTML() {
             const isHost = state.role === 'host';
-            const hasGuest = state.role === 'guest' || state.guestConnected;
             const isSolo = state.mode === 'single';
-            
+            const canStart = isSolo || state.players.length >= 2;
+
+            const playerRows = [];
+            for (let slot = 0; slot < MAX_PLAYERS; slot++) {
+                const p = state.players.find(x => x.slot === slot);
+                const wins = (p && state.round > 0) ? `<span class="text-xs sm:text-sm font-bold text-amber-400">🏆 ${p.wins}</span>` : '';
+                if (p) {
+                    const name = p.id === state.clientId ? `You (${slot === 0 ? 'Host' : 'Guest'})` : (slot === 0 ? 'Player 1 (Host)' : `Player ${slot + 1} Joined`);
+                    playerRows.push(`
+                        <div class="flex items-center justify-between p-3.5 bg-slate-800/50 border border-slate-700 rounded-xl">
+                            <div class="flex items-center gap-2.5">
+                                <div class="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.8)]"></div>
+                                <span class="font-bold text-slate-200 text-sm sm:text-base">${name}</span>
+                            </div>
+                            ${wins}
+                        </div>
+                    `);
+                } else {
+                    playerRows.push(`
+                        <div class="flex items-center justify-between p-3.5 bg-slate-800/50 border border-slate-700 rounded-xl">
+                            <div class="flex items-center gap-2.5">
+                                <div class="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse"></div>
+                                <span class="font-bold text-sm sm:text-base text-slate-400">Waiting for player...</span>
+                            </div>
+                        </div>
+                    `);
+                }
+            }
+
             return `
                 <div class="glass-panel w-full max-w-md p-6 sm:p-10 rounded-3xl pop-in text-center relative z-10">
                     ${!isSolo ? `
@@ -570,38 +783,30 @@
                         <div class="text-5xl sm:text-6xl font-black tracking-[0.1em] text-white mb-6 bg-slate-900/50 py-4 sm:py-6 rounded-2xl border border-slate-700 shadow-inner select-all">
                             ${state.roomCode}
                         </div>
-                        
+
                         <div class="mb-6 space-y-2.5">
-                            <div class="flex items-center justify-between p-3.5 bg-slate-800/50 border border-slate-700 rounded-xl">
-                                <div class="flex items-center gap-2.5">
-                                    <div class="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.8)]"></div>
-                                    <span class="font-bold text-slate-200 text-sm sm:text-base">You (${isHost ? 'Host' : 'Guest'})</span>
-                                </div>
-                            </div>
-                            <div class="flex items-center justify-between p-3.5 bg-slate-800/50 border border-slate-700 rounded-xl">
-                                <div class="flex items-center gap-2.5">
-                                    <div class="w-2.5 h-2.5 rounded-full ${hasGuest ? 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.8)]' : 'bg-amber-500 animate-pulse'}"></div>
-                                    <span class="font-bold text-sm sm:text-base ${hasGuest ? 'text-slate-200' : 'text-slate-400'}">
-                                        ${hasGuest ? 'Opponent Joined' : 'Waiting for opponent...'}
-                                    </span>
-                                </div>
-                            </div>
+                            ${playerRows.join('')}
                         </div>
                     ` : `
                         <h2 class="text-2xl sm:text-3xl font-black text-white mb-6">Solo Practice</h2>
                     `}
-                    
+
                     ${isHost ? `
                         <div class="mb-5 bg-slate-900/50 p-4 rounded-2xl border border-slate-700">
                             <label class="block text-xs sm:text-sm font-bold text-slate-400 mb-2.5 text-left">Timer Duration (Seconds)</label>
                             <input type="number" id="input-duration" value="${state.duration}" min="10" max="900" class="glass-input w-full font-bold text-lg rounded-xl py-2.5 px-3 shadow-inner mb-3.5">
-                            
-                            <label class="flex items-center gap-2.5 cursor-pointer">
+
+                            <label class="flex items-center gap-2.5 cursor-pointer mb-3">
                                 <input type="checkbox" id="input-allow-3" ${state.allow3Letter ? 'checked' : ''} class="w-4 h-4 rounded border-slate-600 text-violet-600 focus:ring-violet-600 bg-slate-800">
                                 <span class="text-xs sm:text-sm font-bold text-slate-300">Allow 3-Letter Words</span>
                             </label>
+
+                            <label class="flex items-center gap-2.5 cursor-pointer">
+                                <input type="checkbox" id="input-show-hidden" ${state.showHidden ? 'checked' : ''} class="w-4 h-4 rounded border-slate-600 text-violet-600 focus:ring-violet-600 bg-slate-800">
+                                <span class="text-xs sm:text-sm font-bold text-slate-300">${isSolo ? 'Show Remaining Words as XXXX' : "Show Opponents' Finds as XXXX"}</span>
+                            </label>
                         </div>
-                        <button type="button" id="btn-start" ${(!hasGuest && !isSolo) ? 'disabled' : ''} class="w-full ${(!hasGuest && !isSolo) ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-white shadow-lg hover:shadow-fuchsia-500/25'} font-black text-base sm:text-lg py-3.5 px-6 rounded-xl transition-all mb-2.5">
+                        <button type="button" id="btn-start" ${!canStart ? 'disabled' : ''} class="w-full ${!canStart ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-white shadow-lg hover:shadow-fuchsia-500/25'} font-black text-base sm:text-lg py-3.5 px-6 rounded-xl transition-all mb-2.5">
                             START GAME
                         </button>
                     ` : `
@@ -610,7 +815,7 @@
                             Waiting for Host to start...
                         </div>
                     `}
-                    
+
                     <button type="button" id="btn-lobby-back" class="w-full bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-600 font-bold py-3 px-4 rounded-xl transition-all text-sm">
                         Back to Menu
                     </button>
@@ -618,14 +823,90 @@
             `;
         }
 
+        function getHiddenPanelBodyHTML() {
+            const chip = 'px-2 py-0.5 bg-slate-800/80 text-slate-500 border border-slate-700 rounded text-xs font-medium font-mono tracking-widest';
+            const heading = 'text-[10px] sm:text-xs font-bold uppercase tracking-widest mb-1.5 border-b border-slate-700/50 pb-0.5';
+
+            if (state.mode === 'single') {
+                const found = new Set(state.myWords);
+                const groups = {};
+                state.currentBoardValidWords.forEach(w => {
+                    if (!found.has(w)) (groups[w.length] = groups[w.length] || []).push(w);
+                });
+                const lengths = Object.keys(groups).map(Number).sort((a, b) => b - a);
+                if (lengths.length === 0) return '<span class="text-slate-500 font-medium italic block text-center mt-3 text-sm">You found every word!</span>';
+                return lengths.map(len => `
+                    <div class="mb-2.5">
+                        <h4 class="${heading} text-slate-500">${len} Letters (${groups[len].length})</h4>
+                        <div class="flex flex-wrap gap-1.5">
+                            ${groups[len].map(() => `<span class="${chip}">${'X'.repeat(len)}</span>`).join('')}
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            const others = orderedPlayers().filter(p => p.id !== state.clientId);
+            const anyFound = others.some(p => (state.oppFound[p.id] || []).length > 0);
+            if (!anyFound) return '<span class="text-slate-500 font-medium italic block text-center mt-3 text-sm">No words found yet.</span>';
+            return others.map(p => {
+                const lens = state.oppFound[p.id] || [];
+                return `
+                    <div class="mb-2.5">
+                        <h4 class="${heading} ${playerColor(p).text}">${playerLabel(p)} (${lens.length})</h4>
+                        <div class="flex flex-wrap gap-1.5">
+                            ${lens.map(len => `<span class="${chip}">${'X'.repeat(len)}</span>`).join('')}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function updateHiddenPanel() {
+            const body = document.getElementById('ui-hidden-body');
+            if (!body) return;
+            body.innerHTML = getHiddenPanelBodyHTML();
+            const countEl = document.getElementById('ui-hidden-count');
+            if (countEl && state.mode === 'single') {
+                countEl.textContent = state.currentBoardValidWords.length - state.myWords.length;
+            }
+        }
+
+        // Rotating only changes how the board is laid out for you - letters stay upright
+        function getRotationOrder() {
+            const order = new Array(16);
+            for (let d = 0; d < 16; d++) {
+                let r = Math.floor(d / 4), c = d % 4;
+                for (let i = 0; i < state.rotation; i++) [r, c] = [3 - c, r];
+                order[r * 4 + c] = d;
+            }
+            return order;
+        }
+
+        function applyBoardRotation() {
+            const order = getRotationOrder();
+            for (let i = 0; i < 16; i++) {
+                const el = document.getElementById(`game-die-${i}`);
+                if (el) el.style.order = order[i];
+            }
+        }
+
+        function rotateBoard() {
+            state.rotation = (state.rotation + 1) % 4;
+            applyBoardRotation();
+            focusInputField();
+        }
+
         function getGameHTML() {
             const isHost = state.role === 'host' || state.mode === 'single';
+            const showHiddenPanel = state.showHidden;
+            const order = getRotationOrder();
+            const multiWaitText = state.players.length === 2 ? 'Waiting for opponent...' : 'Waiting for others...';
             return `
                 <div class="glass-panel w-full max-w-5xl p-4 sm:p-7 lg:p-9 rounded-3xl pop-in flex flex-col lg:flex-row gap-5 sm:gap-8 lg:gap-10 items-center lg:items-start justify-center">
-                    
+
                     <!-- Left: Large Board, Live Bar & Controls (Dominant Focus on Desktop) -->
                     <div class="w-full max-w-[22rem] sm:max-w-[26rem] lg:max-w-[30rem] flex flex-col items-center">
-                        
+
                         <!-- Header Bar: Timer & Status -->
                         <div class="w-full flex justify-between items-center mb-3 sm:mb-4 bg-slate-900/80 rounded-2xl px-4 py-2.5 sm:py-3 shadow-inner border border-slate-700">
                             <div class="flex items-center gap-2">
@@ -636,19 +917,19 @@
                                 ${formatTime(state.duration)}
                             </div>
                         </div>
-                        
+
                         <!-- 4x4 Game Board (Large and Prominent) -->
                         <div class="grid grid-cols-4 gap-2.5 sm:gap-3.5 lg:gap-4 bg-slate-900 p-3 sm:p-5 lg:p-6 rounded-2xl sm:rounded-3xl shadow-2xl border border-slate-700 select-none w-full aspect-square">
                             ${state.board.map((letter, idx) => {
                                 const display = letter === 'Q' ? 'Qu' : letter;
-                                return `<div id="game-die-${idx}" onclick="handleDieClick(${idx})" class="boggle-die aspect-square rounded-xl sm:rounded-2xl flex items-center justify-center text-3xl sm:text-5xl lg:text-6xl font-black text-white uppercase cursor-pointer select-none">${display}</div>`;
+                                return `<div id="game-die-${idx}" onclick="handleDieClick(${idx})" style="order:${order[idx]}" class="boggle-die aspect-square rounded-xl sm:rounded-2xl flex items-center justify-center text-3xl sm:text-5xl lg:text-6xl font-black text-white uppercase cursor-pointer select-none">${display}</div>`;
                             }).join('')}
                         </div>
 
                         <!-- Typing Box & Action Bar Directly Under Board -->
                         <div class="flex gap-2 w-full mt-3 sm:mt-4">
                             <input type="text" id="ui-word-input" placeholder="Type or click letters..." class="glass-input flex-1 min-w-0 font-bold text-sm py-3.5 px-4 rounded-sm uppercase tracking-widest transition-all" autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false">
-                            
+
                             <!-- Delete / Backspace Button -->
                             <button type="button" id="btn-backspace" class="bg-slate-800 hover:bg-slate-700 active:scale-95 text-slate-300 font-bold px-3.5 py-3.5 rounded-xl border border-slate-700 transition-all flex items-center justify-center flex-shrink-0" title="Delete last letter">
                                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2M3 12l6.414-6.414a2 2 0 011.414-.586H19a2 2 0 012 2v10a2 2 0 01-2 2h-9.172a2 2 0 01-1.414-.586L3 12z"/></svg>
@@ -661,36 +942,55 @@
                             </button>
                         </div>
 
-                        ${isHost ? `
-                            <button type="button" id="btn-rescramble" class="mt-2.5 w-full bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700 font-bold py-2.5 px-3 rounded-xl shadow-sm transition-all flex items-center justify-center gap-2 text-xs sm:text-sm">
-                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                                Rescramble Board
+                        <div class="flex gap-2.5 w-full mt-2.5">
+                            <button type="button" id="btn-rotate" class="flex-1 bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700 font-bold py-2.5 px-3 rounded-xl shadow-sm transition-all flex items-center justify-center gap-2 text-xs sm:text-sm">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-3.2-6.9M21 4v5h-5"></path></svg>
+                                Rotate Board
                             </button>
-                        ` : ''}
+                            ${isHost ? `
+                                <button type="button" id="btn-rescramble" class="flex-1 bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700 font-bold py-2.5 px-3 rounded-xl shadow-sm transition-all flex items-center justify-center gap-2 text-xs sm:text-sm">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                    Rescramble Board
+                                </button>
+                            ` : ''}
+                        </div>
                     </div>
-                    
+
                     <!-- Right: Found Words & Finish Game -->
-                    <div class="w-full flex-1 flex flex-col h-56 sm:h-72 lg:h-[35rem] max-w-[22rem] sm:max-w-[26rem] lg:max-w-none">
+                    <div class="w-full flex-1 flex flex-col ${showHiddenPanel ? 'h-[26rem] sm:h-[32rem]' : 'h-56 sm:h-72'} lg:h-[35rem] max-w-[22rem] sm:max-w-[26rem] lg:max-w-none">
                         <div class="flex justify-between items-end mb-2.5 px-1 border-b border-slate-700 pb-2">
                             <h3 class="font-bold text-base sm:text-lg text-slate-300">Found Words <span id="ui-word-count" class="ml-2 bg-violet-900/50 text-violet-300 border border-violet-700/50 py-0.5 px-2.5 rounded-lg text-xs font-bold">${state.myWords.length}</span></h3>
-                            ${state.mode === 'multi' ? `<span class="text-xs font-bold text-slate-500 uppercase tracking-widest">Opponent Hidden</span>` : ''}
+                            ${(state.mode === 'multi' && !showHiddenPanel) ? `<span class="text-xs font-bold text-slate-500 uppercase tracking-widest">Opponents Hidden</span>` : ''}
                         </div>
-                        
-                        <div class="bg-slate-900/40 border border-slate-800 rounded-2xl p-4 flex-grow overflow-y-auto relative flex flex-col">
+
+                        <div class="bg-slate-900/40 border border-slate-800 rounded-2xl p-4 flex-grow min-h-0 overflow-y-auto relative flex flex-col">
                             <div id="ui-word-list" class="flex flex-wrap gap-2 content-start flex-grow">
-                                ${state.myWords.slice().reverse().map(w => `<span class="px-3 py-1.5 bg-slate-800 text-slate-200 border border-slate-600 rounded-lg text-xs sm:text-sm font-bold shadow-sm">${w}</span>`).join('')}
+                                ${state.myWords.map(w => `<span class="px-3 py-1.5 bg-slate-800 text-slate-200 border border-slate-600 rounded-lg text-xs sm:text-sm font-bold shadow-sm">${w}</span>`).join('')}
                             </div>
-                            
+
                             <button type="button" id="btn-finish-early" class="w-full mt-3 bg-rose-900/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/50 font-bold py-3 px-3 rounded-xl transition-all uppercase tracking-widest text-xs sm:text-sm flex-shrink-0">
-                                ${state.myFinishEarly ? (state.mode === 'multi' ? 'Waiting for opponent...' : 'Finishing...') : 'Finish Early'}
+                                ${state.myFinishEarly ? (state.mode === 'multi' ? multiWaitText : 'Finishing...') : 'Finish Early'}
                             </button>
 
                             <div id="ui-end-overlay" class="absolute inset-0 bg-slate-900/90 backdrop-blur-sm rounded-2xl hidden flex-col items-center justify-center text-white z-10 p-5 text-center border border-slate-700">
                                 <svg class="animate-spin h-9 w-9 text-violet-500 mb-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
                                 <h4 class="text-xl font-bold">Time's Up!</h4>
-                                <p class="text-slate-400 text-xs sm:text-sm font-medium">${state.mode === 'multi' ? 'Waiting for opponent data...' : 'Calculating score...'}</p>
+                                <p class="text-slate-400 text-xs sm:text-sm font-medium">${state.mode === 'multi' ? (state.players.length === 2 ? 'Waiting for opponent data...' : 'Waiting for other players...') : 'Calculating score...'}</p>
                             </div>
                         </div>
+
+                        ${showHiddenPanel ? `
+                            <div class="mt-3 flex flex-col h-28 sm:h-36 lg:h-44 flex-shrink-0">
+                                <div class="flex justify-between items-end mb-1.5 px-1 border-b border-slate-700 pb-1.5">
+                                    <h3 class="font-bold text-sm sm:text-base text-slate-300">${state.mode === 'single' ? 'Words Remaining' : "Opponents' Words"}
+                                        ${state.mode === 'single' ? `<span id="ui-hidden-count" class="ml-2 bg-slate-800 text-slate-400 border border-slate-700 py-0.5 px-2.5 rounded-lg text-xs font-bold">${state.currentBoardValidWords.length - state.myWords.length}</span>` : ''}
+                                    </h3>
+                                </div>
+                                <div id="ui-hidden-body" class="bg-slate-900/40 border border-slate-800 rounded-2xl p-3 flex-grow min-h-0 overflow-y-auto">
+                                    ${getHiddenPanelBodyHTML()}
+                                </div>
+                            </div>
+                        ` : ''}
                     </div>
                 </div>
             `;
@@ -795,46 +1095,58 @@
         // ==========================================
         // 6. RESULTS & TRACING ENGINE
         // ==========================================
+        // How many players found each word (a word found by 2+ players scores for nobody)
+        function countWordOwners(words) {
+            const counts = new Map();
+            Object.values(words).forEach(list => {
+                new Set(list).forEach(w => counts.set(w, (counts.get(w) || 0) + 1));
+            });
+            return counts;
+        }
+
+        function computeScores(words) {
+            const counts = countWordOwners(words);
+            const scores = {};
+            Object.keys(words).forEach(id => {
+                scores[id] = words[id].reduce((sum, w) => sum + (counts.get(w) === 1 ? getWordScore(w) : 0), 0);
+            });
+            return scores;
+        }
+
+        function getSoloVerdict(score) {
+            if (score >= 60) return { text: "Boggle Legend! 👑", color: "text-fuchsia-400" };
+            if (score >= 35) return { text: "Word Wizard! 🧙", color: "text-violet-400" };
+            if (score >= 20) return { text: "Great Job! 🔥", color: "text-emerald-400" };
+            if (score >= 10) return { text: "Nice Work!", color: "text-sky-400" };
+            if (score >= 1) return { text: "Warming Up!", color: "text-amber-400" };
+            return { text: "Better Luck Next Time", color: "text-slate-400" };
+        }
+
         function getResultsHTML() {
             const isSolo = state.mode === 'single';
-            const p1Words = state.myWords;
-            const p2Words = state.oppWords || [];
-            
-            const p1Set = new Set(p1Words);
-            const p2Set = new Set(p2Words);
-            const allFoundSet = new Set([...p1Words, ...p2Words]);
-            
-            let p1Score = 0;
-            let p2Score = 0;
-            
-            const p1Render = [];
-            const p2Render = [];
-            
-            p1Words.forEach(w => {
-                if (!isSolo && p2Set.has(w)) {
-                    p1Render.push(`<span onclick="highlightWordPath('${w}')" onmouseenter="highlightWordPath('${w}')" onmouseleave="clearWordPath()" class="word-trace-item px-2.5 py-1 bg-slate-800 text-slate-500 line-through rounded-lg text-xs font-semibold border border-slate-700">${w}</span>`);
-                } else {
-                    const pts = getWordScore(w);
-                    p1Score += pts;
-                    p1Render.push(`<span onclick="highlightWordPath('${w}')" onmouseenter="highlightWordPath('${w}')" onmouseleave="clearWordPath()" class="word-trace-item px-2.5 py-1 bg-emerald-900/30 text-emerald-400 border border-emerald-800 rounded-lg text-xs font-bold">${w} <span class="text-emerald-300 bg-emerald-900/50 px-1 rounded text-[10px] ml-1">+${pts}</span></span>`);
-                }
-            });
-            
-            if (!isSolo) {
-                p2Words.forEach(w => {
-                    if (p1Set.has(w)) {
-                        p2Render.push(`<span onclick="highlightWordPath('${w}')" onmouseenter="highlightWordPath('${w}')" onmouseleave="clearWordPath()" class="word-trace-item px-2.5 py-1 bg-slate-800 text-slate-500 line-through rounded-lg text-xs font-semibold border border-slate-700">${w}</span>`);
-                    } else {
-                        const pts = getWordScore(w);
-                        p2Score += pts;
-                        p2Render.push(`<span onclick="highlightWordPath('${w}')" onmouseenter="highlightWordPath('${w}')" onmouseleave="clearWordPath()" class="word-trace-item px-2.5 py-1 bg-blue-900/30 text-blue-400 border border-blue-800 rounded-lg text-xs font-bold">${w} <span class="text-blue-300 bg-blue-900/50 px-1 rounded text-[10px] ml-1">+${pts}</span></span>`);
-                    }
-                });
-            }
+            const words = state.allWords || {};
+            const plist = orderedPlayers().filter(p => words[p.id]);
+            const counts = countWordOwners(words);
 
-            const missedWords = state.currentBoardValidWords.filter(w => !allFoundSet.has(w));
+            const traceAttrs = (w) => `onclick="highlightWordPath('${w}')" onmouseenter="highlightWordPath('${w}')" onmouseleave="clearWordPath()"`;
+
+            const cards = plist.map((p, i) => {
+                const col = PLAYER_COLORS[i % PLAYER_COLORS.length];
+                let score = 0;
+                const chips = words[p.id].map(w => {
+                    if (!isSolo && counts.get(w) > 1) {
+                        return `<span ${traceAttrs(w)} class="word-trace-item px-2.5 py-1 bg-slate-800 text-slate-500 line-through rounded-lg text-xs font-semibold border border-slate-700">${w}</span>`;
+                    }
+                    const pts = getWordScore(w);
+                    score += pts;
+                    return `<span ${traceAttrs(w)} class="word-trace-item px-2.5 py-1 ${col.chip} rounded-lg text-xs font-bold">${w} <span class="${col.pts} px-1 rounded text-[10px] ml-1">+${pts}</span></span>`;
+                });
+                return { p, col, score, chips, label: playerLabel(p) };
+            });
+
+            const missedWords = state.currentBoardValidWords.filter(w => !counts.has(w));
             const missedGroups = { 3: [], 4: [], 5: [], 6: [], 7: [], 8: [], 9: [] };
-            
+
             missedWords.forEach(w => {
                 const len = w.length;
                 if (len >= 9) missedGroups[9].push(w);
@@ -847,7 +1159,7 @@
                     <div class="mb-3">
                         <h4 class="text-[10px] sm:text-xs font-bold text-slate-500 uppercase tracking-widest mb-1.5 border-b border-slate-700/50 pb-0.5">${lengthStr} (${arr.length})</h4>
                         <div class="flex flex-wrap gap-1.5">
-                            ${arr.map(w => `<span onclick="highlightWordPath('${w}')" onmouseenter="highlightWordPath('${w}')" onmouseleave="clearWordPath()" class="word-trace-item px-2 py-0.5 bg-slate-800/80 hover:bg-violet-950/80 text-slate-400 hover:text-white border border-slate-700 hover:border-violet-500 rounded text-xs font-medium">${w}</span>`).join('')}
+                            ${arr.map(w => `<span ${traceAttrs(w)} class="word-trace-item px-2 py-0.5 bg-slate-800/80 hover:bg-violet-950/80 text-slate-400 hover:text-white border border-slate-700 hover:border-violet-500 rounded text-xs font-medium">${w}</span>`).join('')}
                         </div>
                     </div>
                 `;
@@ -855,19 +1167,90 @@
 
             let winnerText = "Well Done!";
             let winnerColor = "text-emerald-400";
-            
-            if (!isSolo) {
-                if (p1Score > p2Score) {
+
+            if (isSolo) {
+                const verdict = getSoloVerdict(cards.length ? cards[0].score : 0);
+                winnerText = verdict.text;
+                winnerColor = verdict.color;
+            } else {
+                const top = Math.max(...cards.map(c => c.score));
+                const leaders = cards.filter(c => c.score === top);
+                const meLeads = leaders.some(c => c.p.id === state.clientId);
+                if (leaders.length === 1 && meLeads) {
                     winnerText = "You Win! 🏆";
                     winnerColor = "text-emerald-400";
-                } else if (p2Score > p1Score) {
-                    winnerText = "Opponent Wins! 💀";
+                } else if (leaders.length === 1) {
+                    winnerText = `${leaders[0].label} Wins! 💀`;
                     winnerColor = "text-rose-400";
-                } else {
+                } else if (meLeads) {
                     winnerText = "It's a Tie!";
                     winnerColor = "text-amber-400";
+                } else {
+                    winnerText = `${leaders.map(c => c.label).join(' & ')} Tie for the Win! 💀`;
+                    winnerColor = "text-rose-400";
                 }
             }
+
+            const playerCard = (c) => `
+                <div class="bg-slate-900/60 rounded-2xl p-4 sm:p-5 border-t-4 ${c.col.border} flex flex-col h-64 sm:h-72">
+                    <div class="flex justify-between items-end mb-3 pb-3 border-b border-slate-700">
+                        <h2 class="text-xl sm:text-2xl font-black text-white">${c.label}</h2>
+                        <div class="text-3xl sm:text-4xl font-black ${c.col.text} tracking-tighter">${c.score}<span class="text-base font-bold text-slate-500 ml-1">pts</span></div>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5 overflow-y-auto content-start flex-grow pr-1">
+                        ${c.chips.length ? c.chips.join('') : '<span class="text-slate-500 font-medium italic w-full text-center mt-6 text-sm">No words found.</span>'}
+                    </div>
+                </div>
+            `;
+
+            // Visual Board with SVG Path Tracer
+            const boardCard = (extra) => `
+                <div class="bg-slate-900/60 rounded-2xl p-4 sm:p-5 border border-slate-700 flex flex-col items-center justify-center ${extra}">
+                    <div class="text-[11px] font-bold text-violet-400 uppercase tracking-widest mb-2.5 flex items-center gap-1.5">
+                        <svg class="w-4 h-4 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                        <span>Board Trace</span>
+                    </div>
+                    <div id="results-board-container" class="relative bg-slate-950 p-2.5 sm:p-3 rounded-2xl border border-slate-800 shadow-2xl select-none">
+                        <div id="results-board-grid" class="grid grid-cols-4 gap-2">
+                            ${state.board.map((letter, idx) => {
+                                const display = letter === 'Q' ? 'Qu' : letter;
+                                return `<div id="res-die-${idx}" class="res-die aspect-square w-10 h-10 sm:w-11 sm:h-11 rounded-xl flex items-center justify-center text-lg sm:text-xl font-black text-white bg-slate-800/90 border border-slate-700 transition-all duration-150 uppercase">${display}</div>`;
+                            }).join('')}
+                        </div>
+                        <svg id="results-path-svg" class="absolute inset-0 pointer-events-none w-full h-full z-20"></svg>
+                    </div>
+                    <p id="results-hover-hint" class="text-xs text-slate-400 mt-2.5 font-medium text-center">Tap any word to view path</p>
+                </div>
+            `;
+
+            let gridHTML;
+            if (cards.length > 2) {
+                // 3-4 players: board on top, everyone's words below
+                gridHTML = `
+                    <div class="max-w-sm w-full mx-auto mb-4 sm:mb-6">${boardCard('')}</div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 ${cards.length === 3 ? 'lg:grid-cols-3' : 'lg:grid-cols-4'} gap-4 sm:gap-6 mb-6 items-start">
+                        ${cards.map(playerCard).join('')}
+                    </div>
+                `;
+            } else {
+                gridHTML = `
+                    <div class="grid grid-cols-1 ${!isSolo ? 'lg:grid-cols-3' : 'md:grid-cols-2'} gap-4 sm:gap-6 mb-6 items-start">
+                        ${cards[0] ? playerCard(cards[0]) : ''}
+                        ${boardCard('order-first lg:order-none')}
+                        ${cards[1] ? playerCard(cards[1]) : ''}
+                    </div>
+                `;
+            }
+
+            // Running tally of round wins for this room
+            const tallyHTML = !isSolo ? `
+                <div class="flex flex-wrap items-center justify-center gap-2 mb-6">
+                    <span class="text-[10px] sm:text-xs font-bold text-slate-500 uppercase tracking-widest mr-1">Session Wins</span>
+                    ${cards.map(c => `<span class="px-3 py-1 bg-slate-900/60 border border-slate-700 rounded-lg text-xs sm:text-sm font-bold ${c.col.text}">${c.label} <span class="text-white ml-1">${c.p.wins || 0}</span></span>`).join('')}
+                </div>
+            ` : '';
+
+            const missedTitle = isSolo ? 'Words You Missed' : (plist.length === 2 ? 'Words Missed by Both' : 'Words Missed by Everyone');
 
             return `
                 <div class="glass-panel w-full ${isSolo ? 'max-w-4xl' : 'max-w-6xl'} p-5 sm:p-8 rounded-3xl pop-in">
@@ -875,55 +1258,15 @@
                         <h1 class="text-3xl sm:text-5xl font-black ${winnerColor} tracking-tight mb-1.5">${winnerText}</h1>
                         <p class="text-slate-400 font-bold uppercase tracking-widest text-xs sm:text-sm">Final Analysis • Tap words to trace path</p>
                     </div>
-                    
-                    <div class="grid grid-cols-1 ${!isSolo ? 'lg:grid-cols-3' : 'md:grid-cols-2'} gap-4 sm:gap-6 mb-6 items-start">
-                        <!-- You -->
-                        <div class="bg-slate-900/60 rounded-2xl p-4 sm:p-5 border-t-4 border-emerald-500 flex flex-col h-64 sm:h-72">
-                            <div class="flex justify-between items-end mb-3 pb-3 border-b border-slate-700">
-                                <h2 class="text-xl sm:text-2xl font-black text-white">You</h2>
-                                <div class="text-3xl sm:text-4xl font-black text-emerald-400 tracking-tighter">${p1Score}<span class="text-base font-bold text-slate-500 ml-1">pts</span></div>
-                            </div>
-                            <div class="flex flex-wrap gap-1.5 overflow-y-auto content-start flex-grow pr-1">
-                                ${p1Render.length ? p1Render.join('') : '<span class="text-slate-500 font-medium italic w-full text-center mt-6 text-sm">No words found.</span>'}
-                            </div>
-                        </div>
 
-                        <!-- Visual Board with SVG Path Tracer -->
-                        <div class="bg-slate-900/60 rounded-2xl p-4 sm:p-5 border border-slate-700 flex flex-col items-center justify-center order-first lg:order-none">
-                            <div class="text-[11px] font-bold text-violet-400 uppercase tracking-widest mb-2.5 flex items-center gap-1.5">
-                                <svg class="w-4 h-4 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
-                                <span>Board Trace</span>
-                            </div>
-                            <div id="results-board-container" class="relative bg-slate-950 p-2.5 sm:p-3 rounded-2xl border border-slate-800 shadow-2xl select-none">
-                                <div id="results-board-grid" class="grid grid-cols-4 gap-2">
-                                    ${state.board.map((letter, idx) => {
-                                        const display = letter === 'Q' ? 'Qu' : letter;
-                                        return `<div id="res-die-${idx}" class="res-die aspect-square w-10 h-10 sm:w-11 sm:h-11 rounded-xl flex items-center justify-center text-lg sm:text-xl font-black text-white bg-slate-800/90 border border-slate-700 transition-all duration-150 uppercase">${display}</div>`;
-                                    }).join('')}
-                                </div>
-                                <svg id="results-path-svg" class="absolute inset-0 pointer-events-none w-full h-full z-20"></svg>
-                            </div>
-                            <p id="results-hover-hint" class="text-xs text-slate-400 mt-2.5 font-medium text-center">Tap any word to view path</p>
-                        </div>
-                        
-                        <!-- Opponent -->
-                        ${!isSolo ? `
-                            <div class="bg-slate-900/60 rounded-2xl p-4 sm:p-5 border-t-4 border-blue-500 flex flex-col h-64 sm:h-72">
-                                <div class="flex justify-between items-end mb-3 pb-3 border-b border-slate-700">
-                                    <h2 class="text-xl sm:text-2xl font-black text-white">Opponent</h2>
-                                    <div class="text-3xl sm:text-4xl font-black text-blue-400 tracking-tighter">${p2Score}<span class="text-base font-bold text-slate-500 ml-1">pts</span></div>
-                                </div>
-                                <div class="flex flex-wrap gap-1.5 overflow-y-auto content-start flex-grow pr-1">
-                                    ${p2Render.length ? p2Render.join('') : '<span class="text-slate-500 font-medium italic w-full text-center mt-6 text-sm">No words found.</span>'}
-                                </div>
-                            </div>
-                        ` : ''}
-                    </div>
+                    ${tallyHTML}
+
+                    ${gridHTML}
 
                     <!-- Missed Words Grouped -->
                     <div class="mb-6 bg-slate-900/40 rounded-2xl p-4 sm:p-5 border border-slate-800 max-h-72 sm:max-h-80 flex flex-col">
                         <h3 class="text-base sm:text-lg font-bold text-slate-300 mb-3 flex justify-between items-center border-b border-slate-700 pb-2">
-                            <span>Words Missed by Both</span>
+                            <span>${missedTitle}</span>
                             <span class="text-rose-400/80 bg-rose-900/30 px-2.5 py-0.5 rounded-full text-xs">${missedWords.length} total</span>
                         </h3>
                         <div class="overflow-y-auto pr-1 flex-grow">
@@ -935,10 +1278,10 @@
                                 ${renderMissedGroup('5 Letters', missedGroups[5])}
                                 ${renderMissedGroup('4 Letters', missedGroups[4])}
                                 ${renderMissedGroup('3 Letters', missedGroups[3])}
-                            ` : '<span class="text-slate-500 font-medium italic block text-center mt-3 text-sm">You found every possible word!</span>'}
+                            ` : `<span class="text-slate-500 font-medium italic block text-center mt-3 text-sm">${isSolo ? 'You found every possible word!' : 'Every possible word was found!'}</span>`}
                         </div>
                     </div>
-                    
+
                     <div class="text-center flex flex-col sm:flex-row justify-center gap-3">
                         ${state.role === 'host' ? `
                             <button type="button" id="btn-restart" class="bg-violet-600 hover:bg-violet-500 text-white font-bold text-base py-3.5 px-8 rounded-xl shadow-lg transition-all">
@@ -1015,6 +1358,8 @@
                 document.getElementById('btn-solo').addEventListener('click', () => {
                     state.mode = 'single';
                     state.role = 'host';
+                    state.players = [{ id: state.clientId, slot: 0, wins: 0 }];
+                    state.round = 0;
                     state.view = 'lobby';
                     renderView();
                 });
@@ -1063,6 +1408,11 @@
                 const btnBackspace = document.getElementById('btn-backspace');
                 const btnFinish = document.getElementById('btn-finish-early');
                 const btnRescramble = document.getElementById('btn-rescramble');
+                const btnRotate = document.getElementById('btn-rotate');
+
+                if (btnRotate) {
+                    btnRotate.addEventListener('click', rotateBoard);
+                }
 
                 // Submit button click
                 if (btnSubmit) {
@@ -1116,16 +1466,16 @@
                     btnFinish.addEventListener('click', () => {
                         if(state.myFinishEarly) return;
                         state.myFinishEarly = true;
-                        
-                        btnFinish.textContent = state.mode === 'multi' ? "Waiting for opponent..." : "Finishing...";
+
+                        btnFinish.textContent = state.mode === 'multi' ? "Waiting for others..." : "Finishing...";
                         btnFinish.classList.add('opacity-50', 'cursor-not-allowed');
 
                         if (state.mode === 'single') {
                             forceEndGame();
+                        } else if (state.role === 'host') {
+                            markFinished(state.clientId);
                         } else {
-                            const targetTopic = state.role === 'host' ? state.guestTopic : state.hostTopic;
-                            sendMQTT(targetTopic, 'finish_early');
-                            if (state.myFinishEarly && state.oppFinishEarly) forceEndGame();
+                            sendToHost('finish_early');
                         }
                     });
                 }
@@ -1137,10 +1487,8 @@
                 
                 if (btnRestart && state.role === 'host') {
                     btnRestart.addEventListener('click', () => {
-                        if (state.mode === 'multi') sendMQTT(state.guestTopic, 'restart');
-                        state.myWords = [];
-                        state.oppWords = null;
-                        state.selectedDice = [];
+                        resetRoundState();
+                        if (state.mode === 'multi') broadcast('restart', { players: state.players });
                         state.view = 'lobby';
                         renderView();
                     });
@@ -1151,35 +1499,53 @@
             }
         }
 
-        function triggerGameStart(networkType) {
-            let dur = parseInt(document.getElementById('input-duration')?.value || state.duration, 10);
-            if (isNaN(dur) || dur < 10) dur = 180;
-            
-            const allow3 = document.getElementById('input-allow-3') ? document.getElementById('input-allow-3').checked : state.allow3Letter;
-            
-            state.board = generateBoard();
-            state.duration = dur;
-            state.allow3Letter = allow3;
-            state.currentBoardValidWords = solveBoard(state.board);
-            
-            if (state.mode === 'multi') {
-                sendMQTT(state.guestTopic, networkType, {
-                    board: state.board,
-                    duration: state.duration,
-                    allow3Letter: state.allow3Letter
-                });
-            }
-            
+        // Clears everything that belongs to a single round (wins stay with the players)
+        function resetRoundState() {
             state.myWords = [];
-            state.oppWords = null;
+            state.allWords = null;
+            state.oppFound = {};
+            state.finishedIds = [];
+            state.submitted = {};
+            state.resultsPayload = null;
             state.myFinishEarly = false;
-            state.oppFinishEarly = false;
             state.isFinished = false;
             state.selectedDice = [];
+            state.rotation = 0;
             if (state.wordsInterval) {
                 clearInterval(state.wordsInterval);
                 state.wordsInterval = null;
             }
+            if (state.resultsTimeout) {
+                clearTimeout(state.resultsTimeout);
+                state.resultsTimeout = null;
+            }
+        }
+
+        function triggerGameStart(networkType) {
+            let dur = parseInt(document.getElementById('input-duration')?.value || state.duration, 10);
+            if (isNaN(dur) || dur < 10) dur = 180;
+
+            const allow3 = document.getElementById('input-allow-3') ? document.getElementById('input-allow-3').checked : state.allow3Letter;
+            const showHidden = document.getElementById('input-show-hidden') ? document.getElementById('input-show-hidden').checked : state.showHidden;
+
+            state.round++;
+            state.board = generateBoard();
+            state.duration = dur;
+            state.allow3Letter = allow3;
+            state.showHidden = showHidden;
+            state.currentBoardValidWords = solveBoard(state.board);
+            resetRoundState();
+
+            if (state.mode === 'multi') {
+                broadcast(networkType, {
+                    board: state.board,
+                    duration: state.duration,
+                    allow3Letter: state.allow3Letter,
+                    showHidden: state.showHidden,
+                    round: state.round
+                });
+            }
+
             state.view = 'game';
             renderView();
             startGameTimer();
@@ -1187,18 +1553,32 @@
 
         function processWord(word) {
             const minLen = state.allow3Letter ? 3 : 4;
-            
+
             if (word.length < minLen) return flashInputError(`Too short! (Min ${minLen} letters)`);
             if (state.myWords.includes(word)) return flashInputError("Already found!");
-            
+
             if (state.currentBoardValidWords.includes(word)) {
                 state.myWords.push(word);
                 updateWordListUI();
+                if (state.mode === 'single') updateHiddenPanel();
+                if (state.mode === 'multi') announceFound(word.length);
             } else if (fullDictionarySet.has(word)) {
                 return flashInputError("Not on the board!");
             } else {
                 return flashInputError("Not a valid English word!");
             }
+        }
+
+        // Tell everyone that we found a word (only its length - the word stays secret)
+        function announceFound(len) {
+            if (state.role === 'host') broadcast('opp_found', { id: state.clientId, len: len, round: state.round });
+            else sendToHost('found', { len: len, round: state.round });
+        }
+
+        function recordOppFound(id, len) {
+            if (id === state.clientId) return;
+            (state.oppFound[id] = state.oppFound[id] || []).push(len);
+            updateHiddenPanel();
         }
 
         function flashInputError(msg) {
@@ -1212,27 +1592,31 @@
             }
         }
 
+        // New words are added to the end of the list
         function updateWordListUI() {
             const listEl = document.getElementById('ui-word-list');
             const countEl = document.getElementById('ui-word-count');
             if (!listEl || !countEl) return;
 
             countEl.textContent = state.myWords.length;
-            listEl.innerHTML = state.myWords.slice().reverse().map(w => 
+            const w = state.myWords[state.myWords.length - 1];
+            listEl.insertAdjacentHTML('beforeend',
                 `<span class="px-3 py-1.5 bg-slate-800 text-slate-200 border border-slate-600 rounded-lg text-xs sm:text-sm font-bold shadow-sm pop-in">${w}</span>`
-            ).join('');
+            );
+            const scroller = listEl.parentElement;
+            if (scroller) scroller.scrollTop = scroller.scrollHeight;
         }
 
         function startGameTimer() {
             if (state.timerInterval) clearInterval(state.timerInterval);
-            
+
             let timeLeft = state.duration;
             const timerEl = document.getElementById('ui-timer');
-            
+
             state.timerInterval = setInterval(() => {
                 timeLeft--;
                 if (timerEl) timerEl.textContent = formatTime(timeLeft);
-                
+
                 if (timeLeft <= 10 && timerEl && timeLeft > 0) {
                     timerEl.classList.add('text-rose-400', 'animate-pulse');
                 }
@@ -1246,60 +1630,91 @@
             const overlay = document.getElementById('ui-end-overlay');
             const btnFinish = document.getElementById('btn-finish-early');
             const btnRescramble = document.getElementById('btn-rescramble');
+            const btnRotate = document.getElementById('btn-rotate');
             const btnSubmit = document.getElementById('btn-submit-word');
             const btnBackspace = document.getElementById('btn-backspace');
-            
+
             if (input) input.disabled = true;
             if (btnSubmit) btnSubmit.disabled = true;
             if (btnBackspace) btnBackspace.disabled = true;
             if (btnFinish) btnFinish.disabled = true;
             if (btnRescramble) btnRescramble.disabled = true;
-            
+            if (btnRotate) btnRotate.disabled = true;
+
             if (overlay) {
                 overlay.classList.remove('hidden');
                 overlay.classList.add('flex');
             }
-            
+
             state.isFinished = true;
-            
+
             if (state.mode === 'multi') {
-                const targetTopic = state.role === 'host' ? state.guestTopic : state.hostTopic;
-                
-                if (state.wordsInterval) clearInterval(state.wordsInterval);
-                
-                state.wordsInterval = setInterval(() => {
-                    sendMQTT(targetTopic, 'words', { words: state.myWords });
-                    if (state.oppWords !== null) {
-                        clearInterval(state.wordsInterval);
-                        state.wordsInterval = null;
-                    }
-                }, 1000);
-                
-                sendMQTT(targetTopic, 'words', { words: state.myWords });
+                if (state.role === 'host') {
+                    state.submitted[state.clientId] = state.myWords.slice();
+                    // Don't wait forever for a player who dropped without saying goodbye
+                    if (state.resultsTimeout) clearTimeout(state.resultsTimeout);
+                    state.resultsTimeout = setTimeout(buildAndSendResults, 20000);
+                } else {
+                    if (state.wordsInterval) clearInterval(state.wordsInterval);
+                    const sendWords = () => sendToHost('words', { words: state.myWords, round: state.round });
+                    state.wordsInterval = setInterval(sendWords, 1000);
+                    sendWords();
+                }
             }
-            
+
             checkResultsReady();
         }
 
         function checkResultsReady() {
             if (state.mode === 'single') {
-                setTimeout(() => {
-                    state.view = 'results';
-                    renderView();
-                }, 1000); 
+                showResults({ [state.clientId]: state.myWords.slice() });
                 return;
             }
 
-            if (state.isFinished && state.oppWords !== null) {
-                if (state.wordsInterval) {
-                    clearInterval(state.wordsInterval);
-                    state.wordsInterval = null;
-                }
-                setTimeout(() => {
-                    state.view = 'results';
-                    renderView();
-                }, 1000); 
+            if (state.role === 'host' && state.isFinished && !state.resultsPayload &&
+                state.players.every(p => state.submitted[p.id])) {
+                buildAndSendResults();
             }
+        }
+
+        // Host: everyone is in (or we ran out of patience) - score the round and tell the room
+        function buildAndSendResults() {
+            if (state.resultsPayload || state.view !== 'game') return;
+            if (state.resultsTimeout) {
+                clearTimeout(state.resultsTimeout);
+                state.resultsTimeout = null;
+            }
+
+            const words = {};
+            state.players.forEach(p => { words[p.id] = state.submitted[p.id] || []; });
+
+            const scores = computeScores(words);
+            const top = Math.max(...Object.values(scores));
+            if (top > 0) {
+                state.players.forEach(p => { if (scores[p.id] === top) p.wins = (p.wins || 0) + 1; });
+            }
+
+            state.resultsPayload = {
+                round: state.round,
+                words: words,
+                players: state.players.map(p => ({ ...p }))
+            };
+            broadcast('results', state.resultsPayload);
+            showResults(words);
+        }
+
+        function showResults(words) {
+            if (state.allWords) return;
+            state.allWords = words;
+            if (state.wordsInterval) {
+                clearInterval(state.wordsInterval);
+                state.wordsInterval = null;
+            }
+            setTimeout(() => {
+                if (state.allWords !== words) return;
+                state.view = 'results';
+                renderView();
+            }, 1000);
         }
 
         // ==========================================
