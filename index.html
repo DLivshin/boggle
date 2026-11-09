@@ -134,10 +134,10 @@
             try {
                 let res;
                 try {
-                    res = await fetch('./corncob.txt');
+                    res = await fetch('./cel.txt');
                     if (!res.ok) throw new Error();
                 } catch {
-                    res = await fetch('https://raw.githubusercontent.com/pjackowski/passphrase-gen/master/corncob-lowercase.txt');
+                    res = await fetch('https://raw.githubusercontent.com/Fj00/CEL/blob/master/cel_2-15.txt');
                 }
 
                 const text = await res.text();
