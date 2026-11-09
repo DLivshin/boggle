@@ -1,4 +1,4 @@
-A super quick vibe coded Boggle game for 1 or 2 players
+A super quick vibe coded Boggle game for 1 - 4 players
 
 Nothing complicated.
 
