@@ -15838,6 +15838,8 @@ dungbeetle
 dungeon
 dungeons
 dunghill
+dunk
+dunks
 dunked
 dunking
 dunkirk
@@ -15847,6 +15849,7 @@ duodenum
 duologue
 duomo
 duopoly
+duos
 dupe
 duped
 dupes
@@ -32761,6 +32764,7 @@ mossiest
 mossy
 most
 mostly
+mote
 motel
 motels
 motes
@@ -52277,6 +52281,7 @@ tonelessly
 toner
 toners
 tones
+tong
 tonga
 tongs
 tongue
@@ -52399,6 +52404,7 @@ torsion
 torsional
 torsions
 torso
+torsos
 tortoise
 tortoises
 tortoiseshell
@@ -52422,6 +52428,8 @@ tossing
 tossup
 tossups
 tot
+tote
+totes
 total
 totalising
 totalitarian
