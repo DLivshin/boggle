@@ -1,6 +1,7 @@
 aardvark
 aardwolf
-aaron
+Aasvogel
+Aasvogels
 aback
 abacus
 abaft
@@ -57171,6 +57172,8 @@ whistler
 whistles
 whistling
 whists
+whit
+whits
 white
 whitebait
 whiteboards
@@ -57192,6 +57195,7 @@ whither
 whiting
 whitish
 whittle
+whittles
 whittled
 whittling
 whizkids
